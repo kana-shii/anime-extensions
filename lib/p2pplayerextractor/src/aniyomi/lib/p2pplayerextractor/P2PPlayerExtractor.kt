@@ -1,7 +1,8 @@
-package aniyomi.lib.upnshareextractor
+package aniyomi.lib.p2pplayerextractor
 
 import android.util.Base64
 import android.util.Log
+import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.model.Video
 import keiyoushi.lib.cryptoaes.CryptoAES
 import okhttp3.Headers
@@ -9,24 +10,17 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-class UPnShareExtractor(
+class P2PPlayerExtractor(
     private val client: OkHttpClient,
 ) {
     companion object {
-        private const val TAG = "UPnShareExtractor"
+        private const val TAG = "P2PPlayerExtractor"
 
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/150.0.0.0 Safari/537.36"
 
-        /*
-         * Hex:
-         * 6b69656d7469656e6d75613931316361
-         *
-         * UTF-8:
-         * kiemtienmua911ca
-         */
         private const val SECRET_KEY =
             "kiemtienmua911ca"
 
@@ -42,6 +36,10 @@ class UPnShareExtractor(
         )
     }
 
+    private val playlistUtils by lazy {
+        PlaylistUtils(client)
+    }
+
     private val sourceRegexes = listOf(
         Regex(
             """["']source["']\s*:\s*["']((?:\\.|[^"'\\])*)["']""",
@@ -55,7 +53,7 @@ class UPnShareExtractor(
 
     fun videosFromUrl(
         url: String,
-        prefix: String = "UPnShare",
+        prefix: String = "P2P",
     ): List<Video> {
         val token = extractToken(url)
             ?: return emptyList()
@@ -69,7 +67,7 @@ class UPnShareExtractor(
         }.getOrElse { error ->
             Log.e(
                 TAG,
-                "Invalid UPnShare URL: $baseUrl",
+                "Invalid P2P URL: $baseUrl",
                 error,
             )
 
@@ -79,10 +77,32 @@ class UPnShareExtractor(
         val referer = "$baseUrl/"
 
         /*
-         * UPnShare works with these same two headers for both its
-         * API request and HLS playback.
+         * P2PPlay needs these headers when requesting /api/v1/video.
          */
-        val requestHeaders = Headers.Builder()
+        val apiHeaders = Headers.Builder()
+            .add("User-Agent", USER_AGENT)
+            .add(
+                "Accept",
+                "application/json, text/plain, */*",
+            )
+            .add("Referer", referer)
+            .add("Origin", baseUrl)
+            .build()
+
+        /*
+         * The master playlist may also require Origin and Accept.
+         */
+        val masterHeaders = Headers.Builder()
+            .add("User-Agent", USER_AGENT)
+            .add("Accept", "*/*")
+            .add("Referer", referer)
+            .add("Origin", baseUrl)
+            .build()
+
+        /*
+         * Child playlists and video segments should not receive Origin.
+         */
+        val playbackHeaders = Headers.Builder()
             .add("User-Agent", USER_AGENT)
             .add("Referer", referer)
             .build()
@@ -98,31 +118,35 @@ class UPnShareExtractor(
 
         Log.d(
             TAG,
-            "Resolving token=$token api=$apiUrl",
+            "Resolving token=$token " +
+                "api=$apiUrl " +
+                "apiHeaders=${apiHeaders.size} " +
+                "masterHeaders=${masterHeaders.size} " +
+                "playbackHeaders=${playbackHeaders.size}",
         )
 
         val responseText = requestText(
             url = apiUrl.toString(),
-            headers = requestHeaders,
+            headers = apiHeaders,
         ) ?: return emptyList()
 
-        val decryptedPayload = decodeResponse(responseText)
+        val decodedPayload = decodeResponse(responseText)
             ?: run {
                 Log.e(
                     TAG,
-                    "Failed to decode UPnShare response. " +
+                    "Failed to decode P2P response. " +
                         "Preview=${responseText.take(160)}",
                 )
 
                 return emptyList()
             }
 
-        val streamUrl = extractStreamUrl(decryptedPayload)
+        val streamUrl = extractStreamUrl(decodedPayload)
             ?: run {
                 Log.e(
                     TAG,
-                    "No UPnShare stream found. " +
-                        "Payload=${decryptedPayload.take(300)}",
+                    "No P2P stream found. " +
+                        "Payload=${decodedPayload.take(300)}",
                 )
 
                 return emptyList()
@@ -130,35 +154,104 @@ class UPnShareExtractor(
 
         Log.d(
             TAG,
-            "Resolved stream=${streamUrl.substringBefore('?')} " +
-                "headers=${requestHeaders.size}",
+            "Resolved stream=${streamUrl.substringBefore('?')}",
         )
 
+        /*
+         * PlaylistUtils requests the master playlist with masterHeaders
+         * and assigns playbackHeaders to the extracted child streams.
+         */
+        val extractedVideos = runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = streamUrl,
+                referer = referer,
+                masterHeaders = masterHeaders,
+                videoHeaders = playbackHeaders,
+                videoNameGen = { quality ->
+                    formatQuality(
+                        prefix = prefix,
+                        quality = quality,
+                    )
+                },
+            )
+        }.getOrElse { error ->
+            Log.e(
+                TAG,
+                "P2P HLS extraction failed",
+                error,
+            )
+
+            emptyList()
+        }
+
+        /*
+         * PlaylistUtils uses masterHeaders when the URL is already a media
+         * playlist without #EXT-X-STREAM-INF entries. Rebuild each result
+         * so actual playback always uses playbackHeaders.
+         */
+        if (extractedVideos.isNotEmpty()) {
+            return extractedVideos.mapNotNull { video ->
+                val playableUrl = video.videoUrl
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: video.url
+                        .trim()
+                        .takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+
+                val sourceUrl = video.url
+                    .trim()
+                    .takeIf { it.isNotBlank() }
+                    ?: playableUrl
+
+                Video(
+                    url = sourceUrl,
+                    quality = formatQuality(
+                        prefix = prefix,
+                        quality = video.quality,
+                    ),
+                    videoUrl = playableUrl,
+                    headers = playbackHeaders,
+                    subtitleTracks = video.subtitleTracks,
+                    audioTracks = video.audioTracks,
+                )
+            }
+        }
+
+        /*
+         * Fallback for unusual or temporarily inaccessible master playlists.
+         */
         return listOf(
             Video(
                 url = streamUrl,
                 quality = prefix,
                 videoUrl = streamUrl,
-                headers = requestHeaders,
+                headers = playbackHeaders,
             ),
         )
     }
 
-    private fun extractToken(url: String): String? = url.substringAfter("#", "")
-        .substringBefore("&")
-        .substringBefore("?")
-        .trim()
-        .takeIf {
-            it.matches(VALID_TOKEN_REGEX)
-        }
-        .also { token ->
-            if (token == null) {
-                Log.e(
-                    TAG,
-                    "Missing or invalid token in URL: $url",
-                )
+    private fun extractToken(
+        url: String,
+    ): String? {
+        val token = url
+            .substringAfter("#", "")
+            .substringBefore("&")
+            .substringBefore("?")
+            .trim()
+            .takeIf {
+                it.matches(VALID_TOKEN_REGEX)
             }
+
+        if (token == null) {
+            Log.e(
+                TAG,
+                "Missing or invalid token in URL: $url",
+            )
         }
+
+        return token
+    }
 
     private fun requestText(
         url: String,
@@ -180,7 +273,8 @@ class UPnShareExtractor(
 
                     Log.d(
                         TAG,
-                        "API response code=${response.code} " +
+                        "API response " +
+                            "code=${response.code} " +
                             "contentType=${response.header("Content-Type")} " +
                             "length=${body.length}",
                     )
@@ -217,7 +311,7 @@ class UPnShareExtractor(
             .trim()
 
         /*
-         * Handle an already-readable API response.
+         * Some responses may already contain readable JSON.
          */
         if (extractStreamUrl(normalized) != null) {
             return normalized
@@ -246,6 +340,12 @@ class UPnShareExtractor(
                 "${encryptedBytes.size} bytes"
         }
 
+            /*
+             * CryptoAES.decryptCbcIV expects Base64 input where:
+             *
+             * - the first 16 decoded bytes are the IV
+             * - the remaining bytes are the encrypted payload
+             */
         val encryptedBase64 = Base64.encodeToString(
             encryptedBytes,
             Base64.NO_WRAP,
@@ -302,6 +402,34 @@ class UPnShareExtractor(
             ?.trim()
     }
 
+    private fun formatQuality(
+        prefix: String,
+        quality: String,
+    ): String {
+        val cleaned = quality.trim()
+
+        return when {
+            cleaned.isBlank() -> prefix
+
+            cleaned.equals(
+                other = "Video",
+                ignoreCase = true,
+            ) -> prefix
+
+            cleaned.equals(
+                other = prefix,
+                ignoreCase = true,
+            ) -> prefix
+
+            cleaned.startsWith(
+                prefix = prefix,
+                ignoreCase = true,
+            ) -> cleaned
+
+            else -> "$prefix - $cleaned"
+        }
+    }
+
     private fun String.isValidHex(): Boolean = length >= 64 &&
         length % 2 == 0 &&
         all {
@@ -312,6 +440,15 @@ class UPnShareExtractor(
     private fun String.hexToByteArray(): ByteArray {
         require(length % 2 == 0) {
             "Hexadecimal string has an odd length"
+        }
+
+        require(
+            all {
+                it.isDigit() ||
+                    it.lowercaseChar() in 'a'..'f'
+            },
+        ) {
+            "String contains invalid hexadecimal characters"
         }
 
         return ByteArray(length / 2) { index ->

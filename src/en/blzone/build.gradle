@@ -16,5 +16,6 @@ dependencies {
     implementation(project(':lib:mp4uploadextractor'))
     // KNS
     implementation(project(':lib:upnshareextractor'))
+    implementation(project(':lib:p2pplayerextractor'))
     // KNS
 }
