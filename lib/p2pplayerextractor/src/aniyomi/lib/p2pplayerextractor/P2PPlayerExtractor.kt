@@ -214,16 +214,14 @@ class P2PPlayerExtractor(
 
     private fun extractToken(
         url: String,
-    ): String? {
-        return url
-            .substringAfter("#", "")
-            .substringBefore("&")
-            .substringBefore("?")
-            .trim()
-            .takeIf {
-                it.matches(VALID_TOKEN_REGEX)
-            }
-    }
+    ): String? = url
+        .substringAfter("#", "")
+        .substringBefore("&")
+        .substringBefore("?")
+        .trim()
+        .takeIf {
+            it.matches(VALID_TOKEN_REGEX)
+        }
 
     private fun requestText(
         url: String,
@@ -265,9 +263,10 @@ class P2PPlayerExtractor(
         val encryptedHex = when {
             normalized.isValidHex() -> normalized
 
-            else -> HEX_PAYLOAD_REGEX
-                .find(normalized)
-                ?.value
+            else ->
+                HEX_PAYLOAD_REGEX
+                    .find(normalized)
+                    ?.value
         } ?: return null
 
         return decryptHexPayload(encryptedHex)
@@ -275,26 +274,24 @@ class P2PPlayerExtractor(
 
     private fun decryptHexPayload(
         encryptedHex: String,
-    ): String? {
-        return runCatching {
-            val encryptedBytes = encryptedHex
-                .hexToByteArray()
+    ): String? = runCatching {
+        val encryptedBytes = encryptedHex
+            .hexToByteArray()
 
-            require(encryptedBytes.size > 16)
+        require(encryptedBytes.size > 16)
 
-            val encryptedBase64 = Base64.encodeToString(
-                encryptedBytes,
-                Base64.NO_WRAP,
-            )
+        val encryptedBase64 = Base64.encodeToString(
+            encryptedBytes,
+            Base64.NO_WRAP,
+        )
 
-            CryptoAES.decryptCbcIV(
-                encryptedBase64 = encryptedBase64,
-                secretKey = SECRET_KEY,
-            )?.takeIf {
-                it.isNotBlank()
-            }
-        }.getOrNull()
-    }
+        CryptoAES.decryptCbcIV(
+            encryptedBase64 = encryptedBase64,
+            secretKey = SECRET_KEY,
+        )?.takeIf {
+            it.isNotBlank()
+        }
+    }.getOrNull()
 
     private fun extractStreamUrl(
         payload: String,
@@ -358,14 +355,12 @@ class P2PPlayerExtractor(
         }
     }
 
-    private fun String.isValidHex(): Boolean {
-        return length >= 64 &&
-            length % 2 == 0 &&
-            all {
-                it.isDigit() ||
-                    it.lowercaseChar() in 'a'..'f'
-            }
-    }
+    private fun String.isValidHex(): Boolean = length >= 64 &&
+        length % 2 == 0 &&
+        all {
+            it.isDigit() ||
+                it.lowercaseChar() in 'a'..'f'
+        }
 
     private fun String.hexToByteArray(): ByteArray {
         require(length % 2 == 0)
@@ -391,40 +386,38 @@ class P2PPlayerExtractor(
 
     private fun unescapeJsonString(
         value: String,
-    ): String {
-        return value
-            .replace("\\/", "/")
-            .replace(
-                "\\u0026",
-                "&",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u002F",
-                "/",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u003A",
-                ":",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u003F",
-                "?",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u003D",
-                "=",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u0025",
-                "%",
-                ignoreCase = true,
-            )
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-    }
+    ): String = value
+        .replace("\\/", "/")
+        .replace(
+            "\\u0026",
+            "&",
+            ignoreCase = true,
+        )
+        .replace(
+            "\\u002F",
+            "/",
+            ignoreCase = true,
+        )
+        .replace(
+            "\\u003A",
+            ":",
+            ignoreCase = true,
+        )
+        .replace(
+            "\\u003F",
+            "?",
+            ignoreCase = true,
+        )
+        .replace(
+            "\\u003D",
+            "=",
+            ignoreCase = true,
+        )
+        .replace(
+            "\\u0025",
+            "%",
+            ignoreCase = true,
+        )
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
 }
