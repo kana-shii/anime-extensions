@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.animeextension.en.blzone
 
-import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.filemoonextractor.FilemoonExtractor
@@ -27,18 +26,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.TimeUnit
-import kotlin.time.Duration.Companion.milliseconds
 
 class BLZone :
     AnimeHttpSource(),
@@ -54,26 +49,7 @@ class BLZone :
     companion object {
         private const val PREF_SERVER_KEY = "preferred_server"
         private const val PREF_SERVER_DEFAULT = "P2P"
-        private const val TAG = "BLZone"
-
-        /*
-         * Total time BLZone waits for each extractor.
-         *
-         * They all run at the same time, so these do not add together.
-         */
-        private const val DEFAULT_EXTRACTOR_TIMEOUT_MS = 4_000L
-        private const val MIXDROP_EXTRACTOR_TIMEOUT_MS = 3_000L
-        private const val UPN_EXTRACTOR_TIMEOUT_MS = 3_500L
-        private const val P2P_EXTRACTOR_TIMEOUT_MS = 5_000L
-        private const val FILEMOON_EXTRACTOR_TIMEOUT_MS = 6_000L
-
-        /*
-         * OkHttp time limits used by the extractor-specific clients.
-         */
-        private const val FAST_CALL_TIMEOUT_SECONDS = 4L
-        private const val UPN_CALL_TIMEOUT_SECONDS = 4L
-        private const val P2P_CALL_TIMEOUT_SECONDS = 5L
-        private const val FILEMOON_CALL_TIMEOUT_SECONDS = 6L
+        private const val FASTEST_SERVER = "Fastest"
 
         private val SERVER_LIST = arrayOf(
             "StreamTape",
@@ -86,7 +62,12 @@ class BLZone :
             "UPnShare",
         )
 
-        private val directMediaExtensions = listOf(
+        private val SERVER_PREFERENCES = arrayOf(
+            FASTEST_SERVER,
+            *SERVER_LIST,
+        )
+
+        private val DIRECT_MEDIA_EXTENSIONS = listOf(
             ".m3u8",
             ".mp4",
             ".webm",
@@ -96,9 +77,15 @@ class BLZone :
         )
     }
 
+    private data class ResolvedCandidate(
+        val elapsedNanoseconds: Long,
+        val videos: List<Video>,
+    )
+
     // ---- FILTERS ----
 
-    override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter())
+    override fun getFilterList(): AnimeFilterList =
+        AnimeFilterList(TypeFilter())
 
     private class TypeFilter :
         UriPartFilter(
@@ -124,14 +111,10 @@ class BLZone :
 
     // ---- POPULAR ----
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/trending/", headers)
+    override fun popularAnimeRequest(page: Int): Request =
+        GET("$baseUrl/trending/", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage {
-        Log.d(
-            TAG,
-            "popularAnimeParse: HTTP ${response.code} for ${response.request.url}",
-        )
-
         val animeList = response
             .asJsoup()
             .select("#dt-tvshows .item.tvshows, #dt-movies .item.tvshows")
@@ -143,7 +126,9 @@ class BLZone :
         )
     }
 
-    private fun popularAnimeFromElement(element: Element): SAnime {
+    private fun popularAnimeFromElement(
+        element: Element,
+    ): SAnime {
         val anime = SAnime.create()
         val poster = element.selectFirst(".poster")
         val image = poster?.selectFirst("img")
@@ -153,9 +138,13 @@ class BLZone :
             ?.attr("href")
             .orEmpty()
 
-        anime.title = image?.attr("alt")
-            ?: element.selectFirst("h3 a")?.text()
-            ?: "No title"
+        anime.title = image
+            ?.attr("alt")
+            ?.takeIf { it.isNotBlank() }
+            ?: element.selectFirst("h3 a")
+                ?.text()
+                ?.takeIf { it.isNotBlank() }
+                ?: "No title"
 
         anime.thumbnail_url = image?.attr("src")
         anime.setUrlWithoutDomain(link)
@@ -175,12 +164,9 @@ class BLZone :
         return GET(url, headers)
     }
 
-    override fun latestUpdatesParse(response: Response): AnimesPage {
-        Log.d(
-            TAG,
-            "latestUpdatesParse: HTTP ${response.code} for ${response.request.url}",
-        )
-
+    override fun latestUpdatesParse(
+        response: Response,
+    ): AnimesPage {
         val document = response.asJsoup()
 
         val animeList = document
@@ -188,26 +174,24 @@ class BLZone :
             .map(::latestAnimeFromElement)
             .toMutableList()
 
-        if (response.request.url.encodedPath.endsWith("/anime/")) {
+        if (
+            response.request.url.encodedPath.endsWith(
+                "/anime/",
+            )
+        ) {
             runCatching {
                 client.newCall(
                     GET("$baseUrl/dorama/", headers),
                 ).execute().use { doramaResponse ->
                     if (doramaResponse.isSuccessful) {
-                        animeList.addAll(
-                            doramaResponse
-                                .asJsoup()
-                                .select(".items.full .item.tvshows")
-                                .map(::latestAnimeFromElement),
-                        )
+                        val doramaList = doramaResponse
+                            .asJsoup()
+                            .select(".items.full .item.tvshows")
+                            .map(::latestAnimeFromElement)
+
+                        animeList.addAll(doramaList)
                     }
                 }
-            }.onFailure { error ->
-                Log.e(
-                    TAG,
-                    "latestUpdatesParse: dorama request failed",
-                    error,
-                )
             }
         }
 
@@ -217,11 +201,17 @@ class BLZone :
         )
     }
 
-    private fun latestAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+    private fun latestAnimeFromElement(
+        element: Element,
+    ): SAnime = popularAnimeFromElement(element)
 
-    private fun hasNextPage(document: Document): Boolean = document.selectFirst(
-        ".pagination .next:not(.disabled)",
-    ) != null
+    private fun hasNextPage(
+        document: Document,
+    ): Boolean {
+        return document.selectFirst(
+            ".pagination .next:not(.disabled)",
+        ) != null
+    }
 
     // ---- SEARCH ----
 
@@ -246,14 +236,22 @@ class BLZone :
                     addPathSegment("")
                 }
 
-                addQueryParameter("s", query.trim())
+                addQueryParameter(
+                    "s",
+                    query.trim(),
+                )
             }
             .build()
 
-        return GET(url.toString(), headers)
+        return GET(
+            url.toString(),
+            headers,
+        )
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage {
+    override fun searchAnimeParse(
+        response: Response,
+    ): AnimesPage {
         val animeList = response
             .asJsoup()
             .select(".search-page .result-item article")
@@ -265,7 +263,9 @@ class BLZone :
         )
     }
 
-    private fun searchAnimeFromElement(element: Element): SAnime {
+    private fun searchAnimeFromElement(
+        element: Element,
+    ): SAnime {
         val anime = SAnime.create()
         val image = element.selectFirst(".thumbnail img")
 
@@ -274,9 +274,13 @@ class BLZone :
             ?.attr("href")
             .orEmpty()
 
-        anime.title = image?.attr("alt")
-            ?: element.selectFirst(".title a")?.text()
-            ?: "No title"
+        anime.title = image
+            ?.attr("alt")
+            ?.takeIf { it.isNotBlank() }
+            ?: element.selectFirst(".title a")
+                ?.text()
+                ?.takeIf { it.isNotBlank() }
+                ?: "No title"
 
         anime.thumbnail_url = image?.attr("src")
         anime.setUrlWithoutDomain(link)
@@ -286,22 +290,31 @@ class BLZone :
 
     // ---- DETAILS ----
 
-    override fun animeDetailsParse(response: Response): SAnime {
+    override fun animeDetailsParse(
+        response: Response,
+    ): SAnime {
         val document = response.asJsoup()
         val anime = SAnime.create()
-        val poster = document.selectFirst(".sheader .poster img")
+        val poster = document.selectFirst(
+            ".sheader .poster img",
+        )
 
         anime.title = document
             .selectFirst(".sheader .data h1")
             ?.text()
-            ?: poster?.attr("alt")
-            ?: "No title"
+            ?.takeIf { it.isNotBlank() }
+            ?: poster
+                ?.attr("alt")
+                ?.takeIf { it.isNotBlank() }
+                ?: "No title"
 
         anime.thumbnail_url = poster?.attr("src")
 
         anime.genre = document
             .select(".sheader .sgeneros a")
-            .joinToString { it.text() }
+            .joinToString {
+                it.text()
+            }
 
         val description = document
             .selectFirst(".sbox .wp-content p")
@@ -310,7 +323,9 @@ class BLZone :
 
         val alternativeTitle = document
             .selectFirst(
-                ".custom_fields b.variante:contains(Original Title) + span.valor",
+                ".custom_fields " +
+                    "b.variante:contains(Original Title) " +
+                    "+ span.valor",
             )
             ?.text()
             ?.takeIf { it.isNotBlank() }
@@ -331,26 +346,38 @@ class BLZone :
 
     override fun episodeListParse(
         response: Response,
-    ): List<SEpisode> = response
-        .asJsoup()
-        .select("#episodes ul.episodios2 > li")
-        .map(::episodeFromElement)
-        .reversed()
+    ): List<SEpisode> {
+        return response
+            .asJsoup()
+            .select("#episodes ul.episodios2 > li")
+            .map(::episodeFromElement)
+            .reversed()
+    }
 
     private val episodeNumRegex = Regex(
-        """Episode (\d+)""",
+        """Episode\s+(\d+(?:\.\d+)?)""",
         RegexOption.IGNORE_CASE,
     )
 
-    private fun episodeFromElement(element: Element): SEpisode {
+    private fun episodeFromElement(
+        element: Element,
+    ): SEpisode {
         val episode = SEpisode.create()
-        val linkElement = element.selectFirst(".episodiotitle a")
 
-        episode.setUrlWithoutDomain(
-            linkElement?.attr("href").orEmpty(),
+        val linkElement = element.selectFirst(
+            ".episodiotitle a",
         )
 
-        episode.name = linkElement?.text() ?: "Episode"
+        episode.setUrlWithoutDomain(
+            linkElement
+                ?.attr("href")
+                .orEmpty(),
+        )
+
+        episode.name = linkElement
+            ?.text()
+            ?.takeIf { it.isNotBlank() }
+            ?: "Episode"
 
         episodeNumRegex
             .find(episode.name)
@@ -364,60 +391,22 @@ class BLZone :
         return episode
     }
 
-    // ---- EXTRACTOR CLIENTS ----
-
-    private val fastExtractorClient: OkHttpClient by lazy {
-        client.newBuilder()
-            .callTimeout(
-                FAST_CALL_TIMEOUT_SECONDS,
-                TimeUnit.SECONDS,
-            )
-            .build()
-    }
-
-    private val upnExtractorClient: OkHttpClient by lazy {
-        client.newBuilder()
-            .callTimeout(
-                UPN_CALL_TIMEOUT_SECONDS,
-                TimeUnit.SECONDS,
-            )
-            .build()
-    }
-
-    private val p2pExtractorClient: OkHttpClient by lazy {
-        client.newBuilder()
-            .callTimeout(
-                P2P_CALL_TIMEOUT_SECONDS,
-                TimeUnit.SECONDS,
-            )
-            .build()
-    }
-
-    private val filemoonExtractorClient: OkHttpClient by lazy {
-        client.newBuilder()
-            .callTimeout(
-                FILEMOON_CALL_TIMEOUT_SECONDS,
-                TimeUnit.SECONDS,
-            )
-            .build()
-    }
-
-    // ---- VIDEO EXTRACTORS ----
+    // ---- EXTRACTORS ----
 
     private val filemoonExtractor by lazy {
-        FilemoonExtractor(filemoonExtractorClient)
+        FilemoonExtractor(client)
     }
 
     private val streamtapeExtractor by lazy {
-        StreamTapeExtractor(fastExtractorClient)
+        StreamTapeExtractor(client)
     }
 
     private val mixDropExtractor by lazy {
-        MixDropExtractor(fastExtractorClient)
+        MixDropExtractor(client)
     }
 
     private val vidGuardExtractor by lazy {
-        VidGuardExtractor(fastExtractorClient)
+        VidGuardExtractor(client)
     }
 
     private val pixelDrainExtractor by lazy {
@@ -425,15 +414,15 @@ class BLZone :
     }
 
     private val mp4uploadExtractor by lazy {
-        Mp4uploadExtractor(fastExtractorClient)
+        Mp4uploadExtractor(client)
     }
 
     private val upnShareExtractor by lazy {
-        UPnShareExtractor(upnExtractorClient)
+        UPnShareExtractor(client)
     }
 
     private val p2pPlayerExtractor by lazy {
-        P2PPlayerExtractor(p2pExtractorClient)
+        P2PPlayerExtractor(client)
     }
 
     // ---- VIDEO LIST PARSE ----
@@ -441,135 +430,84 @@ class BLZone :
     override fun videoListParse(
         response: Response,
     ): List<Video> {
-        Log.d(
-            TAG,
-            "videoListParse: HTTP ${response.code} for ${response.request.url}",
-        )
-
         val document = response.asJsoup()
 
         val serverNames = document
             .select("#playeroptionsul li span.title")
-            .map { element ->
-                element.text().trim()
+            .map {
+                it.text().trim()
             }
 
         val serverBoxes = document
             .select(".dooplay_player .source-box")
             .drop(1)
 
-        Log.d(
-            TAG,
-            "videoListParse: serverNames=${serverNames.size} " +
-                "serverBoxes=${serverBoxes.size}",
-        )
+        return serverBoxes.mapIndexedNotNull { index, box ->
+            val rawServerName = serverNames.getOrNull(index)
+                ?: return@mapIndexedNotNull null
 
-        return serverBoxes
-            .mapIndexedNotNull { index, box ->
-                val rawServerName = serverNames.getOrNull(index)
-                    ?: return@mapIndexedNotNull null
-
-                val serverName = SERVER_LIST.firstOrNull { knownServer ->
-                    rawServerName.contains(
-                        knownServer,
-                        ignoreCase = true,
-                    )
-                } ?: rawServerName
-
-                val source = box
-                    .selectFirst("iframe.metaframe")
-                    ?.attr("src")
-                    ?.trim()
-                    .orEmpty()
-
-                if (source.isBlank()) {
-                    Log.d(
-                        TAG,
-                        "videoListParse: blank iframe " +
-                            "index=$index server=$serverName",
-                    )
-
-                    return@mapIndexedNotNull null
-                }
-
-                val videoUrl = if (
-                    source.contains("/diclaimer/?url=")
-                ) {
-                    runCatching {
-                        java.net.URLDecoder.decode(
-                            source.substringAfter(
-                                "/diclaimer/?url=",
-                            ),
-                            StandardCharsets.UTF_8.name(),
-                        )
-                    }.getOrElse { error ->
-                        Log.e(
-                            TAG,
-                            "videoListParse: URL decode failed",
-                            error,
-                        )
-
-                        source
-                    }
-                } else {
-                    source
-                }
-
-                Log.d(
-                    TAG,
-                    "videoListParse: index=$index " +
-                        "server=$serverName url=$videoUrl",
+            val serverName = SERVER_LIST.firstOrNull {
+                rawServerName.contains(
+                    it,
+                    ignoreCase = true,
                 )
+            } ?: rawServerName
 
-                Video(
-                    url = videoUrl,
-                    quality = serverName,
-                    videoUrl = videoUrl,
-                )
+            val source = box
+                .selectFirst("iframe.metaframe")
+                ?.attr("src")
+                ?.trim()
+                .orEmpty()
+
+            if (source.isBlank()) {
+                return@mapIndexedNotNull null
             }
-            .also { candidates ->
-                Log.d(
-                    TAG,
-                    "videoListParse: candidates=${candidates.size}",
-                )
+
+            val videoUrl = decodeDisclaimerUrl(source)
+
+            if (!isValidHttpUrl(videoUrl)) {
+                return@mapIndexedNotNull null
             }
+
+            Video(
+                url = videoUrl,
+                quality = serverName,
+                videoUrl = videoUrl,
+            )
+        }
     }
 
-    // ---- GET VIDEO LIST ----
+    private fun decodeDisclaimerUrl(
+        source: String,
+    ): String {
+        if (!source.contains("/diclaimer/?url=")) {
+            return source
+        }
+
+        return runCatching {
+            URLDecoder.decode(
+                source.substringAfter(
+                    "/diclaimer/?url=",
+                ),
+                StandardCharsets.UTF_8.name(),
+            )
+        }.getOrDefault(source)
+    }
+
+    // ---- VIDEO RESOLUTION ----
 
     override suspend fun getVideoList(
         episode: SEpisode,
     ): List<Video> {
-        Log.d(
-            TAG,
-            "getVideoList: start episodeUrl=${episode.url}",
-        )
-
         val response = runCatching {
             client.newCall(
                 GET(baseUrl + episode.url),
             ).await()
-        }.getOrElse { error ->
-            Log.e(
-                TAG,
-                "getVideoList: episode request failed",
-                error,
-            )
-
+        }.getOrElse {
             return emptyList()
         }
 
-        Log.d(
-            TAG,
-            "getVideoList: episode page HTTP ${response.code}",
-        )
-
         if (!response.isSuccessful) {
-            Log.e(
-                TAG,
-                "getVideoList: episode page returned HTTP ${response.code}",
-            )
-
             response.close()
             return emptyList()
         }
@@ -578,347 +516,185 @@ class BLZone :
             videoListParse(it)
         }
 
-        Log.d(
-            TAG,
-            "getVideoList: resolving ${candidates.size} candidates concurrently",
-        )
+        if (candidates.isEmpty()) {
+            return emptyList()
+        }
 
-        /*
-         * Every candidate starts immediately.
-         *
-         * Because the URLs belong to different hosts, one slow server does
-         * not block another server's network request.
-         */
-        return coroutineScope {
-            candidates
-                .map { candidate ->
-                    async(Dispatchers.IO) {
+        val resolvedCandidates = coroutineScope {
+            candidates.map { candidate ->
+                async(Dispatchers.IO) {
+                    val startedAt = System.nanoTime()
+
+                    val videos = runCatching {
                         resolveAndValidateCandidate(candidate)
-                    }
-                }
-                .awaitAll()
-                .flatten()
-                .also { videos ->
-                    Log.i(
-                        TAG,
-                        "getVideoList: final resolved count=${videos.size}",
+                    }.getOrDefault(emptyList())
+
+                    ResolvedCandidate(
+                        elapsedNanoseconds =
+                            System.nanoTime() - startedAt,
+                        videos = videos,
                     )
                 }
+            }.awaitAll()
         }
+
+        return resolvedCandidates
+            .asSequence()
+            .filter {
+                it.videos.isNotEmpty()
+            }
+            .sortedBy {
+                it.elapsedNanoseconds
+            }
+            .flatMap {
+                it.videos.asSequence()
+            }
+            .toList()
     }
 
     private suspend fun resolveAndValidateCandidate(
         candidate: Video,
     ): List<Video> {
-        Log.d(
-            TAG,
-            "getVideoList: resolving " +
-                "server=${candidate.quality} " +
-                "url=${candidate.url}",
-        )
+        return serverVideoResolver(candidate.url)
+            .mapNotNull { resolved ->
+                val directUrl = resolved.videoUrl
+                    ?.trim()
+                    ?.takeIf(::isValidPlayableUrl)
+                    ?: return@mapNotNull null
 
-        val timeoutMillis = extractorTimeoutFor(candidate.url)
+                val sourceUrl = resolved.url
+                    .trim()
+                    .takeIf(::isValidHttpUrl)
+                    ?: directUrl
 
-        val resolvedVideos = withTimeoutOrNull(
-            timeoutMillis.milliseconds,
-        ) {
-            serverVideoResolver(
-                url = candidate.url,
-                quality = candidate.quality,
-            )
-        } ?: run {
-            Log.w(
-                TAG,
-                "getVideoList: extractor timeout " +
-                    "server=${candidate.quality} " +
-                    "timeout=${timeoutMillis}ms " +
-                    "url=${candidate.url}",
-            )
-
-            emptyList()
-        }
-
-        Log.d(
-            TAG,
-            "getVideoList: server=${candidate.quality} " +
-                "results=${resolvedVideos.size}",
-        )
-
-        return resolvedVideos.mapNotNull { resolved ->
-            val directUrl = resolved.videoUrl
-                ?.trim()
-                ?.takeIf(::isValidPlayableUrl)
-                ?: run {
-                    Log.w(
-                        TAG,
-                        "getVideoList: discarded malformed " +
-                            "result server=${candidate.quality} " +
-                            "videoUrl=${resolved.videoUrl}",
-                    )
-
-                    return@mapNotNull null
-                }
-
-            val sourceUrl = resolved.url
-                .trim()
-                .takeIf(::isValidHttpUrl)
-                ?: directUrl
-
-            val finalVideo = Video(
-                url = sourceUrl,
-                quality = formatResolvedQuality(
-                    serverName = candidate.quality,
-                    resolvedQuality = resolved.quality,
-                ),
-                videoUrl = directUrl,
-                headers = resolved.headers,
-                subtitleTracks = resolved.subtitleTracks,
-                audioTracks = resolved.audioTracks,
-            )
-
-            logVideoDiagnostics(
-                sourceQuality = candidate.quality,
-                originalUrl = candidate.url,
-                resolved = finalVideo,
-            )
-
-            finalVideo
-        }
+                Video(
+                    url = sourceUrl,
+                    quality = formatResolvedQuality(
+                        serverName = candidate.quality,
+                        resolvedQuality = resolved.quality,
+                    ),
+                    videoUrl = directUrl,
+                    headers = resolved.headers,
+                    subtitleTracks = resolved.subtitleTracks,
+                    audioTracks = resolved.audioTracks,
+                )
+            }
     }
-
-    private fun extractorTimeoutFor(url: String): Long = when {
-        url.contains(
-            "filemoon",
-            ignoreCase = true,
-        ) -> FILEMOON_EXTRACTOR_TIMEOUT_MS
-
-        url.contains(
-            "p2pplay.online",
-            ignoreCase = true,
-        ) -> P2P_EXTRACTOR_TIMEOUT_MS
-
-        url.contains(
-            "upns.online",
-            ignoreCase = true,
-        ) -> UPN_EXTRACTOR_TIMEOUT_MS
-
-        url.contains(
-            "mixdrop",
-            ignoreCase = true,
-        ) -> MIXDROP_EXTRACTOR_TIMEOUT_MS
-
-        else -> DEFAULT_EXTRACTOR_TIMEOUT_MS
-    }
-
-    // ---- SERVER RESOLVER ----
 
     private suspend fun serverVideoResolver(
         url: String,
-        quality: String,
     ): List<Video> {
-        Log.d(
-            TAG,
-            "serverVideoResolver: quality=$quality url=$url",
-        )
-
         return when {
             url.contains(
                 "filemoon",
                 ignoreCase = true,
-            ) -> {
-                runExtractor(
-                    serverName = "FileMoon",
-                ) {
-                    filemoonExtractor.videosFromUrl(
-                        url,
-                        "FileMoon",
-                    )
-                }
+            ) -> runExtractor {
+                filemoonExtractor.videosFromUrl(
+                    url,
+                    "FileMoon",
+                )
             }
 
             url.contains(
                 "streamtape",
                 ignoreCase = true,
-            ) -> {
-                runExtractor(
-                    serverName = "StreamTape",
-                ) {
-                    streamtapeExtractor.videosFromUrl(
-                        url,
-                        "StreamTape",
-                    )
-                }
+            ) -> runExtractor {
+                streamtapeExtractor.videosFromUrl(
+                    url,
+                    "StreamTape",
+                )
             }
 
             url.contains(
                 "mixdrop",
                 ignoreCase = true,
-            ) -> {
-                runExtractor(
-                    serverName = "MixDrop",
-                ) {
-                    /*
-                     * Do not pass "MixDrop" as the language argument.
-                     * The extractor already names its result MixDrop.
-                     */
-                    mixDropExtractor.videosFromUrl(
-                        url = url,
-                        referer = mixDropReferer(url),
-                    )
-                }
+            ) -> runExtractor {
+                mixDropExtractor.videosFromUrl(
+                    url = url,
+                    referer = mixDropReferer(url),
+                )
             }
 
             url.contains(
                 "vgembed",
                 ignoreCase = true,
-            ) -> {
-                runExtractor(
-                    serverName = "VidGuard",
-                ) {
-                    vidGuardExtractor.videosFromUrl(
-                        url,
-                        "VidGuard",
-                    )
-                }
+            ) -> runExtractor {
+                vidGuardExtractor.videosFromUrl(
+                    url,
+                    "VidGuard",
+                )
             }
 
             url.contains(
                 "pixeldrain",
                 ignoreCase = true,
-            ) -> {
-                runExtractor(
-                    serverName = "Pixel",
-                ) {
-                    pixelDrainExtractor.videosFromUrl(
-                        url.substringBefore("?"),
-                        "Pixel",
-                    )
-                }
+            ) -> runExtractor {
+                pixelDrainExtractor.videosFromUrl(
+                    url.substringBefore("?"),
+                    "Pixel",
+                )
             }
 
             url.contains(
                 "mp4upload",
                 ignoreCase = true,
-            ) -> {
-                runExtractor(
-                    serverName = "MP4",
-                ) {
-                    mp4uploadExtractor.videosFromUrl(
-                        url,
-                        headers,
-                    )
-                }
+            ) -> runExtractor {
+                mp4uploadExtractor.videosFromUrl(
+                    url,
+                    headers,
+                )
             }
 
             url.contains(
                 "upns.online",
                 ignoreCase = true,
-            ) -> {
-                /*
-                 * UPnShare has been reliable, so retrying it only wastes time.
-                 */
-                resolveWithRetry(
-                    serverName = "UPnShare",
-                    attempts = 1,
-                ) {
-                    upnShareExtractor.videosFromUrl(
-                        url = url,
-                        prefix = "UPnShare",
-                    )
-                }
+            ) -> runExtractor {
+                upnShareExtractor.videosFromUrl(
+                    url = url,
+                    prefix = "UPnShare",
+                )
             }
 
             url.contains(
                 "p2pplay.online",
                 ignoreCase = true,
-            ) -> {
-                /*
-                 * Keep one retry because its API occasionally returns an
-                 * empty result on the first request.
-                 */
-                resolveWithRetry(
-                    serverName = "P2P",
-                    attempts = 2,
-                ) {
-                    p2pPlayerExtractor.videosFromUrl(
-                        url = url,
-                        prefix = "P2P",
-                    )
-                }
-            }
-
-            else -> {
-                Log.w(
-                    TAG,
-                    "serverVideoResolver: unsupported URL $url",
+            ) -> runExtractor {
+                p2pPlayerExtractor.videosFromUrl(
+                    url = url,
+                    prefix = "P2P",
                 )
-
-                emptyList()
             }
+
+            else -> emptyList()
         }
     }
 
     private inline fun runExtractor(
-        serverName: String,
-        block: () -> List<Video>,
-    ): List<Video> = runCatching(block)
-        .getOrElse { error ->
-            Log.e(
-                TAG,
-                "$serverName extractor failed",
-                error,
-            )
-
-            emptyList()
-        }
-
-    private suspend fun resolveWithRetry(
-        serverName: String,
-        attempts: Int,
         block: () -> List<Video>,
     ): List<Video> {
-        repeat(attempts) { index ->
-            val attempt = index + 1
-
-            val result = runCatching(block)
-                .getOrElse { error ->
-                    Log.e(
-                        TAG,
-                        "$serverName attempt=$attempt failed",
-                        error,
-                    )
-
-                    emptyList()
-                }
-
-            Log.d(
-                TAG,
-                "$serverName resolution attempt=$attempt " +
-                    "resultCount=${result.size}",
-            )
-
-            if (result.isNotEmpty()) {
-                return result
-            }
-
-            if (attempt < attempts) {
-                delay(150.milliseconds)
-            }
-        }
-
-        return emptyList()
+        return runCatching(block)
+            .getOrDefault(emptyList())
     }
 
     // ---- VIDEO HELPERS ----
 
-    private fun mixDropReferer(url: String): String {
+    private fun mixDropReferer(
+        url: String,
+    ): String {
         val parsedUrl = url.toHttpUrlOrNull()
             ?: return "https://mixdrop.co/"
 
-        return "${parsedUrl.scheme}://${parsedUrl.host}/"
+        return buildString {
+            append(parsedUrl.scheme)
+            append("://")
+            append(parsedUrl.host)
+            append("/")
+        }
     }
 
-    private fun isValidPlayableUrl(value: String): Boolean {
+    private fun isValidPlayableUrl(
+        value: String,
+    ): Boolean {
         if (
             value.contains(
                 "MDCore.",
@@ -928,7 +704,7 @@ class BLZone :
                 "undefined",
                 ignoreCase = true,
             ) ||
-            value.contains(
+            value.equals(
                 "null",
                 ignoreCase = true,
             ) ||
@@ -945,7 +721,9 @@ class BLZone :
         return isValidHttpUrl(value)
     }
 
-    private fun isValidHttpUrl(value: String): Boolean {
+    private fun isValidHttpUrl(
+        value: String,
+    ): Boolean {
         if (
             !value.startsWith(
                 "https://",
@@ -962,21 +740,15 @@ class BLZone :
         val parsedUrl = value.toHttpUrlOrNull()
             ?: return false
 
-        return (
-            parsedUrl.scheme == "http" ||
-                parsedUrl.scheme == "https"
-            ) &&
-            parsedUrl.host.isNotBlank() &&
-            (
-                parsedUrl.host.contains('.') ||
-                    parsedUrl.host == "localhost"
-                )
+        return parsedUrl.host.isNotBlank()
     }
 
-    private fun cleanServerName(rawName: String): String {
-        val matched = SERVER_LIST.firstOrNull { server ->
+    private fun cleanServerName(
+        rawName: String,
+    ): String {
+        val matched = SERVER_LIST.firstOrNull {
             rawName.contains(
-                server,
+                it,
                 ignoreCase = true,
             )
         } ?: rawName
@@ -1000,10 +772,6 @@ class BLZone :
         val cleanServer = cleanServerName(serverName)
         val cleanResolved = resolvedQuality.trim()
 
-        /*
-         * Correct duplicated labels such as PixelPixelDrain or
-         * MixDrop(MixDrop).
-         */
         if (
             cleanServer.equals(
                 "Pixel",
@@ -1052,41 +820,17 @@ class BLZone :
         }
     }
 
-    private fun logVideoDiagnostics(
-        sourceQuality: String,
-        originalUrl: String,
-        resolved: Video,
-    ) {
-        val resolvedUrl = resolved.videoUrl.orEmpty()
-        val lowercaseUrl = resolvedUrl.lowercase()
-        val urlWithoutQuery = lowercaseUrl.substringBefore("?")
-        val headersCount = resolved.headers?.size ?: 0
+    @Suppress("unused")
+    private fun isDirectMediaUrl(
+        url: String,
+    ): Boolean {
+        val normalizedUrl = url
+            .substringBefore("?")
+            .lowercase()
 
-        val malformed = !isValidPlayableUrl(resolvedUrl)
-
-        val directMedia =
-            directMediaExtensions.any { extension ->
-                urlWithoutQuery.endsWith(extension)
-            } ||
-                lowercaseUrl.contains(".m3u8")
-
-        val hostPage =
-            lowercaseUrl.contains("/e/") ||
-                lowercaseUrl.contains("/embed") ||
-                lowercaseUrl.contains("/u/")
-
-        Log.d(
-            TAG,
-            "videoDiag[resolved]: " +
-                "sourceQuality=$sourceQuality " +
-                "resolvedQuality=${resolved.quality} " +
-                "malformed=$malformed " +
-                "directMedia=$directMedia " +
-                "hostPage=$hostPage " +
-                "headersCount=$headersCount " +
-                "originalUrl=$originalUrl " +
-                "resolvedUrl=$resolvedUrl",
-        )
+        return DIRECT_MEDIA_EXTENSIONS.any {
+            normalizedUrl.endsWith(it)
+        }
     }
 
     // ---- SORTING ----
@@ -1097,19 +841,37 @@ class BLZone :
             PREF_SERVER_DEFAULT,
         ) ?: PREF_SERVER_DEFAULT
 
-        Log.d(
-            TAG,
-            "sort: preferredServer=$preferredServer",
-        )
+        if (
+            preferredServer == FASTEST_SERVER ||
+            isEmpty()
+        ) {
+            return this
+        }
 
-        return sortedWith(
-            compareByDescending { video ->
-                video.quality.contains(
-                    preferredServer,
-                    ignoreCase = true,
-                )
-            },
-        )
+        val preferredVideos = filter {
+            it.quality.contains(
+                preferredServer,
+                ignoreCase = true,
+            )
+        }
+
+        if (preferredVideos.isEmpty()) {
+            /*
+             * getVideoList already ordered the results by extractor
+             * completion speed, so the fastest successful server remains
+             * first when the preferred server is unavailable.
+             */
+            return this
+        }
+
+        val remainingVideos = filterNot {
+            it.quality.contains(
+                preferredServer,
+                ignoreCase = true,
+            )
+        }
+
+        return preferredVideos + remainingVideos
     }
 
     // ---- PREFERENCES ----
@@ -1120,8 +882,8 @@ class BLZone :
         ListPreference(screen.context).apply {
             key = PREF_SERVER_KEY
             title = "Preferred server"
-            entries = SERVER_LIST
-            entryValues = SERVER_LIST
+            entries = SERVER_PREFERENCES
+            entryValues = SERVER_PREFERENCES
             setDefaultValue(PREF_SERVER_DEFAULT)
             summary = "%s"
         }.also(screen::addPreference)

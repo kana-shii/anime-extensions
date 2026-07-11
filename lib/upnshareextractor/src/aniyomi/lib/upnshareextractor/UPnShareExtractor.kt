@@ -1,7 +1,6 @@
 package aniyomi.lib.upnshareextractor
 
 import android.util.Base64
-import android.util.Log
 import eu.kanade.tachiyomi.animesource.model.Video
 import keiyoushi.lib.cryptoaes.CryptoAES
 import okhttp3.Headers
@@ -13,20 +12,11 @@ class UPnShareExtractor(
     private val client: OkHttpClient,
 ) {
     companion object {
-        private const val TAG = "UPnShareExtractor"
-
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/150.0.0.0 Safari/537.36"
 
-        /*
-         * Hex:
-         * 6b69656d7469656e6d75613931316361
-         *
-         * UTF-8:
-         * kiemtienmua911ca
-         */
         private const val SECRET_KEY =
             "kiemtienmua911ca"
 
@@ -66,73 +56,54 @@ class UPnShareExtractor(
 
         val baseHttpUrl = runCatching {
             baseUrl.toHttpUrl()
-        }.getOrElse { error ->
-            Log.e(
-                TAG,
-                "Invalid UPnShare URL: $baseUrl",
-                error,
-            )
-
+        }.getOrElse {
             return emptyList()
         }
 
         val referer = "$baseUrl/"
 
-        /*
-         * UPnShare works with these same two headers for both its
-         * API request and HLS playback.
-         */
         val requestHeaders = Headers.Builder()
-            .add("User-Agent", USER_AGENT)
-            .add("Referer", referer)
+            .add(
+                "User-Agent",
+                USER_AGENT,
+            )
+            .add(
+                "Referer",
+                referer,
+            )
             .build()
 
         val apiUrl = baseHttpUrl
             .newBuilder()
             .addPathSegments("api/v1/video")
-            .addQueryParameter("id", token)
-            .addQueryParameter("w", "1920")
-            .addQueryParameter("h", "1200")
-            .addQueryParameter("r", "")
+            .addQueryParameter(
+                "id",
+                token,
+            )
+            .addQueryParameter(
+                "w",
+                "1920",
+            )
+            .addQueryParameter(
+                "h",
+                "1200",
+            )
+            .addQueryParameter(
+                "r",
+                "",
+            )
             .build()
-
-        Log.d(
-            TAG,
-            "Resolving token=$token api=$apiUrl",
-        )
 
         val responseText = requestText(
             url = apiUrl.toString(),
             headers = requestHeaders,
         ) ?: return emptyList()
 
-        val decryptedPayload = decodeResponse(responseText)
-            ?: run {
-                Log.e(
-                    TAG,
-                    "Failed to decode UPnShare response. " +
-                        "Preview=${responseText.take(160)}",
-                )
+        val decodedPayload = decodeResponse(responseText)
+            ?: return emptyList()
 
-                return emptyList()
-            }
-
-        val streamUrl = extractStreamUrl(decryptedPayload)
-            ?: run {
-                Log.e(
-                    TAG,
-                    "No UPnShare stream found. " +
-                        "Payload=${decryptedPayload.take(300)}",
-                )
-
-                return emptyList()
-            }
-
-        Log.d(
-            TAG,
-            "Resolved stream=${streamUrl.substringBefore('?')} " +
-                "headers=${requestHeaders.size}",
-        )
+        val streamUrl = extractStreamUrl(decodedPayload)
+            ?: return emptyList()
 
         return listOf(
             Video(
@@ -144,21 +115,18 @@ class UPnShareExtractor(
         )
     }
 
-    private fun extractToken(url: String): String? = url.substringAfter("#", "")
-        .substringBefore("&")
-        .substringBefore("?")
-        .trim()
-        .takeIf {
-            it.matches(VALID_TOKEN_REGEX)
-        }
-        .also { token ->
-            if (token == null) {
-                Log.e(
-                    TAG,
-                    "Missing or invalid token in URL: $url",
-                )
+    private fun extractToken(
+        url: String,
+    ): String? {
+        return url
+            .substringAfter("#", "")
+            .substringBefore("&")
+            .substringBefore("?")
+            .trim()
+            .takeIf {
+                it.matches(VALID_TOKEN_REGEX)
             }
-        }
+    }
 
     private fun requestText(
         url: String,
@@ -174,38 +142,15 @@ class UPnShareExtractor(
             client.newCall(request)
                 .execute()
                 .use { response ->
-                    val body = response.body
+                    if (!response.isSuccessful) {
+                        return@use null
+                    }
+
+                    response.body
                         .string()
                         .trim()
-
-                    Log.d(
-                        TAG,
-                        "API response code=${response.code} " +
-                            "contentType=${response.header("Content-Type")} " +
-                            "length=${body.length}",
-                    )
-
-                    if (!response.isSuccessful) {
-                        Log.e(
-                            TAG,
-                            "API request returned HTTP ${response.code}. " +
-                                "Body=${body.take(200)}",
-                        )
-
-                        null
-                    } else {
-                        body
-                    }
                 }
-        }.getOrElse { error ->
-            Log.e(
-                TAG,
-                "API request failed for $url",
-                error,
-            )
-
-            null
-        }
+        }.getOrNull()
     }
 
     private fun decodeResponse(
@@ -216,9 +161,6 @@ class UPnShareExtractor(
             .removeSurrounding("\"")
             .trim()
 
-        /*
-         * Handle an already-readable API response.
-         */
         if (extractStreamUrl(normalized) != null) {
             return normalized
         }
@@ -226,10 +168,9 @@ class UPnShareExtractor(
         val encryptedHex = when {
             normalized.isValidHex() -> normalized
 
-            else ->
-                HEX_PAYLOAD_REGEX
-                    .find(normalized)
-                    ?.value
+            else -> HEX_PAYLOAD_REGEX
+                .find(normalized)
+                ?.value
         } ?: return null
 
         return decryptHexPayload(encryptedHex)
@@ -237,34 +178,25 @@ class UPnShareExtractor(
 
     private fun decryptHexPayload(
         encryptedHex: String,
-    ): String? = runCatching {
-        val encryptedBytes = encryptedHex
-            .hexToByteArray()
+    ): String? {
+        return runCatching {
+            val encryptedBytes = encryptedHex
+                .hexToByteArray()
 
-        require(encryptedBytes.size > 16) {
-            "Encrypted payload is too short: " +
-                "${encryptedBytes.size} bytes"
-        }
+            require(encryptedBytes.size > 16)
 
-        val encryptedBase64 = Base64.encodeToString(
-            encryptedBytes,
-            Base64.NO_WRAP,
-        )
+            val encryptedBase64 = Base64.encodeToString(
+                encryptedBytes,
+                Base64.NO_WRAP,
+            )
 
-        CryptoAES.decryptCbcIV(
-            encryptedBase64 = encryptedBase64,
-            secretKey = SECRET_KEY,
-        )?.takeIf {
-            it.isNotBlank()
-        }
-    }.getOrElse { error ->
-        Log.e(
-            TAG,
-            "AES decryption failed",
-            error,
-        )
-
-        null
+            CryptoAES.decryptCbcIV(
+                encryptedBase64 = encryptedBase64,
+                secretKey = SECRET_KEY,
+            )?.takeIf {
+                it.isNotBlank()
+            }
+        }.getOrNull()
     }
 
     private fun extractStreamUrl(
@@ -292,8 +224,7 @@ class UPnShareExtractor(
             }
         }
 
-        val normalizedPayload =
-            unescapeJsonString(payload)
+        val normalizedPayload = unescapeJsonString(payload)
 
         return DIRECT_MEDIA_REGEX
             .find(normalizedPayload)
@@ -302,17 +233,24 @@ class UPnShareExtractor(
             ?.trim()
     }
 
-    private fun String.isValidHex(): Boolean = length >= 64 &&
-        length % 2 == 0 &&
-        all {
-            it.isDigit() ||
-                it.lowercaseChar() in 'a'..'f'
-        }
+    private fun String.isValidHex(): Boolean {
+        return length >= 64 &&
+            length % 2 == 0 &&
+            all {
+                it.isDigit() ||
+                    it.lowercaseChar() in 'a'..'f'
+            }
+    }
 
     private fun String.hexToByteArray(): ByteArray {
-        require(length % 2 == 0) {
-            "Hexadecimal string has an odd length"
-        }
+        require(length % 2 == 0)
+
+        require(
+            all {
+                it.isDigit() ||
+                    it.lowercaseChar() in 'a'..'f'
+            },
+        )
 
         return ByteArray(length / 2) { index ->
             val start = index * 2
@@ -320,45 +258,48 @@ class UPnShareExtractor(
             substring(
                 start,
                 start + 2,
-            ).toInt(16)
+            )
+                .toInt(16)
                 .toByte()
         }
     }
 
     private fun unescapeJsonString(
         value: String,
-    ): String = value
-        .replace("\\/", "/")
-        .replace(
-            "\\u0026",
-            "&",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u002F",
-            "/",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u003A",
-            ":",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u003F",
-            "?",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u003D",
-            "=",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u0025",
-            "%",
-            ignoreCase = true,
-        )
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    ): String {
+        return value
+            .replace("\\/", "/")
+            .replace(
+                "\\u0026",
+                "&",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u002F",
+                "/",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u003A",
+                ":",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u003F",
+                "?",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u003D",
+                "=",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u0025",
+                "%",
+                ignoreCase = true,
+            )
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    }
 }

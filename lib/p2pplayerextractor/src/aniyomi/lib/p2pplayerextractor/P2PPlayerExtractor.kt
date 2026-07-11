@@ -1,7 +1,6 @@
 package aniyomi.lib.p2pplayerextractor
 
 import android.util.Base64
-import android.util.Log
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.model.Video
 import keiyoushi.lib.cryptoaes.CryptoAES
@@ -14,8 +13,6 @@ class P2PPlayerExtractor(
     private val client: OkHttpClient,
 ) {
     companion object {
-        private const val TAG = "P2PPlayerExtractor"
-
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -64,66 +61,70 @@ class P2PPlayerExtractor(
 
         val baseHttpUrl = runCatching {
             baseUrl.toHttpUrl()
-        }.getOrElse { error ->
-            Log.e(
-                TAG,
-                "Invalid P2P URL: $baseUrl",
-                error,
-            )
-
+        }.getOrElse {
             return emptyList()
         }
 
         val referer = "$baseUrl/"
 
-        /*
-         * P2PPlay needs these headers when requesting /api/v1/video.
-         */
         val apiHeaders = Headers.Builder()
-            .add("User-Agent", USER_AGENT)
+            .add(
+                "User-Agent",
+                USER_AGENT,
+            )
             .add(
                 "Accept",
                 "application/json, text/plain, */*",
             )
-            .add("Referer", referer)
-            .add("Origin", baseUrl)
+            .add(
+                "Referer",
+                referer,
+            )
+            .add(
+                "Origin",
+                baseUrl,
+            )
             .build()
 
-        /*
-         * The master playlist may also require Origin and Accept.
-         */
-        val masterHeaders = Headers.Builder()
-            .add("User-Agent", USER_AGENT)
-            .add("Accept", "*/*")
-            .add("Referer", referer)
-            .add("Origin", baseUrl)
-            .build()
-
-        /*
-         * Child playlists and video segments should not receive Origin.
-         */
         val playbackHeaders = Headers.Builder()
-            .add("User-Agent", USER_AGENT)
-            .add("Referer", referer)
+            .add(
+                "User-Agent",
+                USER_AGENT,
+            )
+            .add(
+                "Accept",
+                "*/*",
+            )
+            .add(
+                "Referer",
+                referer,
+            )
+            .add(
+                "Origin",
+                baseUrl,
+            )
             .build()
 
         val apiUrl = baseHttpUrl
             .newBuilder()
             .addPathSegments("api/v1/video")
-            .addQueryParameter("id", token)
-            .addQueryParameter("w", "1920")
-            .addQueryParameter("h", "1200")
-            .addQueryParameter("r", "")
+            .addQueryParameter(
+                "id",
+                token,
+            )
+            .addQueryParameter(
+                "w",
+                "1920",
+            )
+            .addQueryParameter(
+                "h",
+                "1200",
+            )
+            .addQueryParameter(
+                "r",
+                "",
+            )
             .build()
-
-        Log.d(
-            TAG,
-            "Resolving token=$token " +
-                "api=$apiUrl " +
-                "apiHeaders=${apiHeaders.size} " +
-                "masterHeaders=${masterHeaders.size} " +
-                "playbackHeaders=${playbackHeaders.size}",
-        )
 
         val responseText = requestText(
             url = apiUrl.toString(),
@@ -131,110 +132,90 @@ class P2PPlayerExtractor(
         ) ?: return emptyList()
 
         val decodedPayload = decodeResponse(responseText)
-            ?: run {
-                Log.e(
-                    TAG,
-                    "Failed to decode P2P response. " +
-                        "Preview=${responseText.take(160)}",
-                )
-
-                return emptyList()
-            }
+            ?: return emptyList()
 
         val streamUrl = extractStreamUrl(decodedPayload)
-            ?: run {
-                Log.e(
-                    TAG,
-                    "No P2P stream found. " +
-                        "Payload=${decodedPayload.take(300)}",
+            ?: return emptyList()
+
+        if (
+            streamUrl
+                .substringBefore("?")
+                .endsWith(
+                    ".mp4",
+                    ignoreCase = true,
                 )
+        ) {
+            return listOf(
+                Video(
+                    url = streamUrl,
+                    quality = prefix,
+                    videoUrl = streamUrl,
+                    headers = playbackHeaders,
+                ),
+            )
+        }
 
-                return emptyList()
-            }
-
-        Log.d(
-            TAG,
-            "Resolved stream=${streamUrl.substringBefore('?')}",
-        )
-
-        /*
-         * PlaylistUtils requests the master playlist with masterHeaders
-         * and assigns playbackHeaders to the extracted child streams.
-         */
         val extractedVideos = runCatching {
             playlistUtils.extractFromHls(
                 playlistUrl = streamUrl,
                 referer = referer,
-                masterHeaders = masterHeaders,
+                masterHeaders = playbackHeaders,
                 videoHeaders = playbackHeaders,
                 videoNameGen = { quality ->
-                    formatQuality(
-                        prefix = prefix,
-                        quality = quality,
-                    )
+                    quality
                 },
             )
-        }.getOrElse { error ->
-            Log.e(
-                TAG,
-                "P2P HLS extraction failed",
-                error,
-            )
+        }.getOrDefault(emptyList())
 
-            emptyList()
-        }
-
-        /*
-         * PlaylistUtils uses masterHeaders when the URL is already a media
-         * playlist without #EXT-X-STREAM-INF entries. Rebuild each result
-         * so actual playback always uses playbackHeaders.
-         */
-        if (extractedVideos.isNotEmpty()) {
-            return extractedVideos.mapNotNull { video ->
-                val playableUrl = video.videoUrl
-                    ?.trim()
-                    ?.takeIf { it.isNotBlank() }
-                    ?: video.url
-                        .trim()
-                        .takeIf { it.isNotBlank() }
-                    ?: return@mapNotNull null
-
-                val sourceUrl = video.url
-                    .trim()
-                    .takeIf { it.isNotBlank() }
-                    ?: playableUrl
-
+        if (extractedVideos.isEmpty()) {
+            return listOf(
                 Video(
-                    url = sourceUrl,
-                    quality = formatQuality(
-                        prefix = prefix,
-                        quality = video.quality,
-                    ),
-                    videoUrl = playableUrl,
+                    url = streamUrl,
+                    quality = prefix,
+                    videoUrl = streamUrl,
                     headers = playbackHeaders,
-                    subtitleTracks = video.subtitleTracks,
-                    audioTracks = video.audioTracks,
-                )
-            }
+                ),
+            )
         }
 
-        /*
-         * Fallback for unusual or temporarily inaccessible master playlists.
-         */
-        return listOf(
+        return extractedVideos.mapNotNull { video ->
+            val playableUrl = video.videoUrl
+                ?.trim()
+                ?.takeIf {
+                    it.isNotBlank()
+                }
+                ?: video.url
+                    .trim()
+                    .takeIf {
+                        it.isNotBlank()
+                    }
+                ?: return@mapNotNull null
+
+            val sourceUrl = video.url
+                .trim()
+                .takeIf {
+                    it.isNotBlank()
+                }
+                ?: playableUrl
+
             Video(
-                url = streamUrl,
-                quality = prefix,
-                videoUrl = streamUrl,
+                url = sourceUrl,
+                quality = formatQuality(
+                    prefix = prefix,
+                    quality = video.quality,
+                ),
+                videoUrl = playableUrl,
                 headers = playbackHeaders,
-            ),
-        )
+                subtitleTracks = video.subtitleTracks,
+                audioTracks = video.audioTracks,
+            )
+        }
     }
 
     private fun extractToken(
         url: String,
     ): String? {
-        val token = url
+        return url
             .substringAfter("#", "")
             .substringBefore("&")
             .substringBefore("?")
@@ -242,15 +223,6 @@ class P2PPlayerExtractor(
             .takeIf {
                 it.matches(VALID_TOKEN_REGEX)
             }
-
-        if (token == null) {
-            Log.e(
-                TAG,
-                "Missing or invalid token in URL: $url",
-            )
-        }
-
-        return token
     }
 
     private fun requestText(
@@ -267,39 +239,15 @@ class P2PPlayerExtractor(
             client.newCall(request)
                 .execute()
                 .use { response ->
-                    val body = response.body
+                    if (!response.isSuccessful) {
+                        return@use null
+                    }
+
+                    response.body
                         .string()
                         .trim()
-
-                    Log.d(
-                        TAG,
-                        "API response " +
-                            "code=${response.code} " +
-                            "contentType=${response.header("Content-Type")} " +
-                            "length=${body.length}",
-                    )
-
-                    if (!response.isSuccessful) {
-                        Log.e(
-                            TAG,
-                            "API request returned HTTP ${response.code}. " +
-                                "Body=${body.take(200)}",
-                        )
-
-                        null
-                    } else {
-                        body
-                    }
                 }
-        }.getOrElse { error ->
-            Log.e(
-                TAG,
-                "API request failed for $url",
-                error,
-            )
-
-            null
-        }
+        }.getOrNull()
     }
 
     private fun decodeResponse(
@@ -310,9 +258,6 @@ class P2PPlayerExtractor(
             .removeSurrounding("\"")
             .trim()
 
-        /*
-         * Some responses may already contain readable JSON.
-         */
         if (extractStreamUrl(normalized) != null) {
             return normalized
         }
@@ -320,10 +265,9 @@ class P2PPlayerExtractor(
         val encryptedHex = when {
             normalized.isValidHex() -> normalized
 
-            else ->
-                HEX_PAYLOAD_REGEX
-                    .find(normalized)
-                    ?.value
+            else -> HEX_PAYLOAD_REGEX
+                .find(normalized)
+                ?.value
         } ?: return null
 
         return decryptHexPayload(encryptedHex)
@@ -331,40 +275,25 @@ class P2PPlayerExtractor(
 
     private fun decryptHexPayload(
         encryptedHex: String,
-    ): String? = runCatching {
-        val encryptedBytes = encryptedHex
-            .hexToByteArray()
+    ): String? {
+        return runCatching {
+            val encryptedBytes = encryptedHex
+                .hexToByteArray()
 
-        require(encryptedBytes.size > 16) {
-            "Encrypted payload is too short: " +
-                "${encryptedBytes.size} bytes"
-        }
+            require(encryptedBytes.size > 16)
 
-            /*
-             * CryptoAES.decryptCbcIV expects Base64 input where:
-             *
-             * - the first 16 decoded bytes are the IV
-             * - the remaining bytes are the encrypted payload
-             */
-        val encryptedBase64 = Base64.encodeToString(
-            encryptedBytes,
-            Base64.NO_WRAP,
-        )
+            val encryptedBase64 = Base64.encodeToString(
+                encryptedBytes,
+                Base64.NO_WRAP,
+            )
 
-        CryptoAES.decryptCbcIV(
-            encryptedBase64 = encryptedBase64,
-            secretKey = SECRET_KEY,
-        )?.takeIf {
-            it.isNotBlank()
-        }
-    }.getOrElse { error ->
-        Log.e(
-            TAG,
-            "AES decryption failed",
-            error,
-        )
-
-        null
+            CryptoAES.decryptCbcIV(
+                encryptedBase64 = encryptedBase64,
+                secretKey = SECRET_KEY,
+            )?.takeIf {
+                it.isNotBlank()
+            }
+        }.getOrNull()
     }
 
     private fun extractStreamUrl(
@@ -392,8 +321,7 @@ class P2PPlayerExtractor(
             }
         }
 
-        val normalizedPayload =
-            unescapeJsonString(payload)
+        val normalizedPayload = unescapeJsonString(payload)
 
         return DIRECT_MEDIA_REGEX
             .find(normalizedPayload)
@@ -412,17 +340,17 @@ class P2PPlayerExtractor(
             cleaned.isBlank() -> prefix
 
             cleaned.equals(
-                other = "Video",
+                "Video",
                 ignoreCase = true,
             ) -> prefix
 
             cleaned.equals(
-                other = prefix,
+                prefix,
                 ignoreCase = true,
             ) -> prefix
 
             cleaned.startsWith(
-                prefix = prefix,
+                prefix,
                 ignoreCase = true,
             ) -> cleaned
 
@@ -430,26 +358,24 @@ class P2PPlayerExtractor(
         }
     }
 
-    private fun String.isValidHex(): Boolean = length >= 64 &&
-        length % 2 == 0 &&
-        all {
-            it.isDigit() ||
-                it.lowercaseChar() in 'a'..'f'
-        }
+    private fun String.isValidHex(): Boolean {
+        return length >= 64 &&
+            length % 2 == 0 &&
+            all {
+                it.isDigit() ||
+                    it.lowercaseChar() in 'a'..'f'
+            }
+    }
 
     private fun String.hexToByteArray(): ByteArray {
-        require(length % 2 == 0) {
-            "Hexadecimal string has an odd length"
-        }
+        require(length % 2 == 0)
 
         require(
             all {
                 it.isDigit() ||
                     it.lowercaseChar() in 'a'..'f'
             },
-        ) {
-            "String contains invalid hexadecimal characters"
-        }
+        )
 
         return ByteArray(length / 2) { index ->
             val start = index * 2
@@ -457,45 +383,48 @@ class P2PPlayerExtractor(
             substring(
                 start,
                 start + 2,
-            ).toInt(16)
+            )
+                .toInt(16)
                 .toByte()
         }
     }
 
     private fun unescapeJsonString(
         value: String,
-    ): String = value
-        .replace("\\/", "/")
-        .replace(
-            "\\u0026",
-            "&",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u002F",
-            "/",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u003A",
-            ":",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u003F",
-            "?",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u003D",
-            "=",
-            ignoreCase = true,
-        )
-        .replace(
-            "\\u0025",
-            "%",
-            ignoreCase = true,
-        )
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    ): String {
+        return value
+            .replace("\\/", "/")
+            .replace(
+                "\\u0026",
+                "&",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u002F",
+                "/",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u003A",
+                ":",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u003F",
+                "?",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u003D",
+                "=",
+                ignoreCase = true,
+            )
+            .replace(
+                "\\u0025",
+                "%",
+                ignoreCase = true,
+            )
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    }
 }
