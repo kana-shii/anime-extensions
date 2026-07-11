@@ -1,9 +1,12 @@
 package eu.kanade.tachiyomi.animeextension.en.blzone
 
+import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.filemoonextractor.FilemoonExtractor
 import aniyomi.lib.mixdropextractor.MixDropExtractor
+import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
+import aniyomi.lib.pixeldrainextractor.PixelDrainExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.vidguardextractor.VidGuardExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -43,10 +46,23 @@ class BLZone :
     companion object {
         private const val PREF_SERVER_KEY = "preferred_server"
         private const val PREF_SERVER_DEFAULT = "Filemoon"
-        private val SERVER_LIST = arrayOf("Filemoon", "StreamTape", "MixDrop", "VidGuard")
+        private val SERVER_LIST = arrayOf(
+            "Filemoon",
+            "StreamTape",
+            "MixDrop",
+            "VidGuard",
+            "P2P",
+            "upnshare",
+            "Pixel",
+            "MP4",
+        )
+        private const val TAG = "BLZone"
+
+        // KNS
+        private val directMediaExtensions = listOf(".m3u8", ".mp4", ".webm", ".mkv", ".mov", ".m4v")
+        // KNS
     }
 
-    // ---- FILTERS ----
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter())
 
     private class TypeFilter :
@@ -65,7 +81,6 @@ class BLZone :
         fun isDefault() = state == 0
     }
 
-    // ---- POPULAR ----
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/trending/", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage {
@@ -89,7 +104,6 @@ class BLZone :
         return anime
     }
 
-    // ---- LATEST ----
     override fun latestUpdatesRequest(page: Int): Request {
         val animePageUrl = if (page == 1) "$baseUrl/anime/" else "$baseUrl/anime/page/$page/"
         return GET(animePageUrl, headers)
@@ -118,7 +132,6 @@ class BLZone :
 
     private fun hasNextPage(document: Document): Boolean = document.selectFirst(".pagination .next:not(.disabled)") != null
 
-    // ---- SEARCH ----
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val typeFilter = filters.filterIsInstance<TypeFilter>().firstOrNull()
         val url = baseUrl.toHttpUrl()
@@ -149,7 +162,6 @@ class BLZone :
         return anime
     }
 
-    // ---- DETAILS ----
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         val anime = SAnime.create()
@@ -169,7 +181,6 @@ class BLZone :
         return anime
     }
 
-    // ---- EPISODES ----
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
         return document.select("#episodes ul.episodios2 > li").map { episodeFromElement(it) }.reversed()
@@ -187,59 +198,142 @@ class BLZone :
         return ep
     }
 
-    // ---- VIDEO EXTRACTORS ----
     private val filemoonExtractor by lazy { FilemoonExtractor(client) }
     private val streamtapeExtractor by lazy { StreamTapeExtractor(client) }
     private val mixDropExtractor by lazy { MixDropExtractor(client) }
     private val vidGuardExtractor by lazy { VidGuardExtractor(client) }
+    private val pixelDrainExtractor by lazy { PixelDrainExtractor() }
+    private val mp4uploadExtractor by lazy { Mp4uploadExtractor(client) }
 
-    // ---- VIDEO LIST PARSE ----
     override fun videoListParse(response: Response): List<Video> {
         val document = response.asJsoup()
         val serverNames = document.select("#playeroptionsul li span.title").map { it.text().trim() }
         val serverBoxes = document.select(".dooplay_player .source-box").drop(1)
 
+        Log.d(TAG, "videoListParse: found ${serverNames.size} server names, ${serverBoxes.size} source boxes")
+
         return serverBoxes.mapIndexedNotNull { index, box ->
-            val matchedServerName = serverNames.getOrNull(index)?.let { serverName ->
-                SERVER_LIST.firstOrNull { serverName.contains(it, ignoreCase = true) }
-            } ?: return@mapIndexedNotNull null
+            val rawServerName = serverNames.getOrNull(index) ?: return@mapIndexedNotNull null
+            val matchedServerName = SERVER_LIST.firstOrNull { rawServerName.contains(it, ignoreCase = true) } ?: rawServerName
 
             val iframe = box.selectFirst("iframe.metaframe")
             val src = iframe?.attr("src")?.trim().orEmpty()
-            if (src.isBlank()) return@mapIndexedNotNull null
+            if (src.isBlank()) {
+                Log.d(TAG, "videoListParse: skipped blank src at index=$index server=$matchedServerName rawServer=$rawServerName")
+                return@mapIndexedNotNull null
+            }
+
             val videoUrl = if (src.contains("/diclaimer/?url=")) {
                 java.net.URLDecoder.decode(src.substringAfter("/diclaimer/?url="), StandardCharsets.UTF_8.name())
             } else {
                 src
             }
+
+            Log.d(TAG, "videoListParse: index=$index server=$matchedServerName rawServer=$rawServerName rawSrc=$src resolvedUrl=$videoUrl")
             Video(videoUrl, matchedServerName, videoUrl)
+        }.also {
+            Log.d(TAG, "videoListParse: parsed ${it.size} candidate videos")
         }
     }
 
-    // ---- GET VIDEO LIST ----
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
+        Log.d(TAG, "getVideoList: start episodeUrl=${episode.url}")
+
         val response = client.newCall(GET(baseUrl + episode.url)).await()
         val videos = videoListParse(response)
+
+        Log.d(TAG, "getVideoList: videoListParse returned ${videos.size} candidates")
 
         return coroutineScope {
             videos.map { video ->
                 async(Dispatchers.IO) {
                     try {
-                        serverVideoResolver(video.url)
+                        Log.d(TAG, "getVideoList: resolving url=${video.url} quality=${video.quality}")
+                        val resolvedVideos = serverVideoResolver(video.url, video.quality)
+                        Log.d(TAG, "getVideoList: resolved ${resolvedVideos.size} videos from url=${video.url}")
+                        resolvedVideos.forEachIndexed { i, resolved ->
+                            Log.d(TAG, "getVideoList: resolved[$i] quality=${resolved.quality} videoUrl=${resolved.videoUrl}")
+                            // KNS
+                            logVideoDiagnostics(
+                                stage = "resolved",
+                                sourceQuality = video.quality,
+                                originalUrl = video.url,
+                                resolved = resolved,
+                            )
+                            // KNS
+                        }
+                        resolvedVideos
                     } catch (e: Exception) {
+                        Log.e(TAG, "getVideoList: resolver failed for url=${video.url} quality=${video.quality}", e)
                         emptyList()
                     }
                 }
-            }.awaitAll().flatten()
+            }.awaitAll().flatten().also {
+                Log.d(TAG, "getVideoList: final resolved video count=${it.size}")
+            }
         }
     }
 
-    private fun serverVideoResolver(url: String): List<Video> = when {
-        url.contains("filemoon") -> filemoonExtractor.videosFromUrl(url, "FileMoon")
-        url.contains("streamtape") -> streamtapeExtractor.videosFromUrl(url, "StreamTape")
-        url.contains("mixdrop") -> mixDropExtractor.videosFromUrl(url, "MixDrop")
-        url.contains("vgembed") -> vidGuardExtractor.videosFromUrl(url, "VidGuard")
-        else -> emptyList()
+    private fun serverVideoResolver(url: String, quality: String): List<Video> {
+        Log.d(TAG, "serverVideoResolver: start quality=$quality url=$url")
+
+        val resolved = when {
+            url.contains("filemoon", ignoreCase = true) -> filemoonExtractor.videosFromUrl(url, "FileMoon")
+            url.contains("streamtape", ignoreCase = true) -> streamtapeExtractor.videosFromUrl(url, "StreamTape")
+            url.contains("mixdrop", ignoreCase = true) -> mixDropExtractor.videosFromUrl(url, "MixDrop")
+            url.contains("vgembed", ignoreCase = true) -> vidGuardExtractor.videosFromUrl(url, "VidGuard")
+            // KNS
+            url.contains("pixeldrain", ignoreCase = true) -> {
+                val cleanUrl = url.substringBefore("?")
+                pixelDrainExtractor.videosFromUrl(cleanUrl, "Pixel")
+            }
+            // KNS
+            // KNS
+            url.contains("mp4upload", ignoreCase = true) -> mp4uploadExtractor.videosFromUrl(url, headers)
+            // KNS
+            url.contains("p2pplay", ignoreCase = true) -> listOf(Video(url, "P2P", url))
+            url.contains("upns.online", ignoreCase = true) -> listOf(Video(url, "upnshare", url))
+            else -> {
+                Log.d(TAG, "serverVideoResolver: unsupported host quality=$quality url=$url")
+                emptyList()
+            }
+        }
+
+        Log.d(TAG, "serverVideoResolver: end quality=$quality url=$url resolvedCount=${resolved.size}")
+        return resolved
+    }
+    private fun logVideoDiagnostics(stage: String, sourceQuality: String, originalUrl: String, resolved: Video) {
+        // KNS
+        val resolvedUrl = resolved.videoUrl ?: ""
+        val lower = resolvedUrl.lowercase()
+        // KNS
+
+        val isMalformed = !resolvedUrl.startsWith("http://") && !resolvedUrl.startsWith("https://")
+        val hasFragment = resolvedUrl.contains("#")
+        val fragmentOnlyPattern = resolvedUrl.contains("/#")
+        val looksDirectMedia = directMediaExtensions.any { lower.substringBefore("?").endsWith(it) } || lower.contains(".m3u8")
+        val looksHostPage = lower.contains("/e/") || lower.contains("/embed") || lower.contains("/u/")
+        val headersCount = resolved.headers!!.size
+
+        Log.d(
+            TAG,
+            "videoDiag[$stage]: sourceQuality=$sourceQuality resolvedQuality=${resolved.quality} " +
+                "malformed=$isMalformed directMedia=$looksDirectMedia hostPage=$looksHostPage " +
+                "hasFragment=$hasFragment fragmentOnly=$fragmentOnlyPattern headersCount=$headersCount " +
+                "originalUrl=$originalUrl resolvedUrl=$resolvedUrl",
+        )
+
+        if (isMalformed) {
+            Log.w(TAG, "videoDiag[$stage]: MALFORMED resolved URL (likely unplayable): $resolvedUrl")
+        }
+
+        if (fragmentOnlyPattern) {
+            Log.w(TAG, "videoDiag[$stage]: URL depends on fragment token (#...), extractor likely missing: $resolvedUrl")
+        }
+
+        if (!looksDirectMedia && !looksHostPage && !isMalformed) {
+            Log.w(TAG, "videoDiag[$stage]: URL type unknown for player compatibility: $resolvedUrl")
+        }
     }
 
     override fun List<Video>.sort(): List<Video> {
