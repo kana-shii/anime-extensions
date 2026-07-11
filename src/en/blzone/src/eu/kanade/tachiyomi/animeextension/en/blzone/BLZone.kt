@@ -8,6 +8,7 @@ import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
 import aniyomi.lib.pixeldrainextractor.PixelDrainExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
+import aniyomi.lib.upnshareextractor.UPnShareExtractor
 import aniyomi.lib.vidguardextractor.VidGuardExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -45,24 +46,27 @@ class BLZone :
 
     companion object {
         private const val PREF_SERVER_KEY = "preferred_server"
-        private const val PREF_SERVER_DEFAULT = "Filemoon"
+        private const val PREF_SERVER_DEFAULT = "P2P"
         private val SERVER_LIST = arrayOf(
-            "Filemoon",
             "StreamTape",
+            "Pixel",
+            "MP4",
+            "Filemoon",
+            // KNS
             "MixDrop",
             "VidGuard",
             "P2P",
-            "upnshare",
-            "Pixel",
-            "MP4",
+            "UPnShare",
+            // KNS
         )
-        private const val TAG = "BLZone"
 
         // KNS
+        private const val TAG = "BLZone"
         private val directMediaExtensions = listOf(".m3u8", ".mp4", ".webm", ".mkv", ".mov", ".m4v")
         // KNS
     }
 
+    // ---- FILTERS ----
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter())
 
     private class TypeFilter :
@@ -81,6 +85,7 @@ class BLZone :
         fun isDefault() = state == 0
     }
 
+    // ---- POPULAR ----
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/trending/", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage {
@@ -104,6 +109,7 @@ class BLZone :
         return anime
     }
 
+    // ---- LATEST ----
     override fun latestUpdatesRequest(page: Int): Request {
         val animePageUrl = if (page == 1) "$baseUrl/anime/" else "$baseUrl/anime/page/$page/"
         return GET(animePageUrl, headers)
@@ -132,6 +138,7 @@ class BLZone :
 
     private fun hasNextPage(document: Document): Boolean = document.selectFirst(".pagination .next:not(.disabled)") != null
 
+    // ---- SEARCH ----
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val typeFilter = filters.filterIsInstance<TypeFilter>().firstOrNull()
         val url = baseUrl.toHttpUrl()
@@ -162,6 +169,7 @@ class BLZone :
         return anime
     }
 
+    // ---- DETAILS ----
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         val anime = SAnime.create()
@@ -181,6 +189,7 @@ class BLZone :
         return anime
     }
 
+    // ---- EPISODES ----
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
         return document.select("#episodes ul.episodios2 > li").map { episodeFromElement(it) }.reversed()
@@ -198,28 +207,40 @@ class BLZone :
         return ep
     }
 
+    // ---- VIDEO EXTRACTORS ----
     private val filemoonExtractor by lazy { FilemoonExtractor(client) }
     private val streamtapeExtractor by lazy { StreamTapeExtractor(client) }
     private val mixDropExtractor by lazy { MixDropExtractor(client) }
     private val vidGuardExtractor by lazy { VidGuardExtractor(client) }
+
+    // KNS
     private val pixelDrainExtractor by lazy { PixelDrainExtractor() }
     private val mp4uploadExtractor by lazy { Mp4uploadExtractor(client) }
+    private val upnShareExtractor by lazy { UPnShareExtractor(client) }
+    // KNS
 
+    // ---- VIDEO LIST PARSE ----
     override fun videoListParse(response: Response): List<Video> {
         val document = response.asJsoup()
         val serverNames = document.select("#playeroptionsul li span.title").map { it.text().trim() }
         val serverBoxes = document.select(".dooplay_player .source-box").drop(1)
 
+        // KNS
         Log.d(TAG, "videoListParse: found ${serverNames.size} server names, ${serverBoxes.size} source boxes")
+        // KNS
 
         return serverBoxes.mapIndexedNotNull { index, box ->
             val rawServerName = serverNames.getOrNull(index) ?: return@mapIndexedNotNull null
+            // KNS
             val matchedServerName = SERVER_LIST.firstOrNull { rawServerName.contains(it, ignoreCase = true) } ?: rawServerName
+            // KNS
 
             val iframe = box.selectFirst("iframe.metaframe")
             val src = iframe?.attr("src")?.trim().orEmpty()
             if (src.isBlank()) {
+                // KNS
                 Log.d(TAG, "videoListParse: skipped blank src at index=$index server=$matchedServerName rawServer=$rawServerName")
+                // KNS
                 return@mapIndexedNotNull null
             }
 
@@ -229,55 +250,73 @@ class BLZone :
                 src
             }
 
+            // KNS
             Log.d(TAG, "videoListParse: index=$index server=$matchedServerName rawServer=$rawServerName rawSrc=$src resolvedUrl=$videoUrl")
+            // KNS
+
             Video(videoUrl, matchedServerName, videoUrl)
         }.also {
+            // KNS
             Log.d(TAG, "videoListParse: parsed ${it.size} candidate videos")
+            // KNS
         }
     }
 
+    // ---- GET VIDEO LIST ----
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
+        // KNS
         Log.d(TAG, "getVideoList: start episodeUrl=${episode.url}")
+        // KNS
 
         val response = client.newCall(GET(baseUrl + episode.url)).await()
         val videos = videoListParse(response)
 
+        // KNS
         Log.d(TAG, "getVideoList: videoListParse returned ${videos.size} candidates")
+        // KNS
 
         return coroutineScope {
             videos.map { video ->
                 async(Dispatchers.IO) {
                     try {
+                        // KNS
                         Log.d(TAG, "getVideoList: resolving url=${video.url} quality=${video.quality}")
+                        // KNS
                         val resolvedVideos = serverVideoResolver(video.url, video.quality)
+                        // KNS
                         Log.d(TAG, "getVideoList: resolved ${resolvedVideos.size} videos from url=${video.url}")
                         resolvedVideos.forEachIndexed { i, resolved ->
                             Log.d(TAG, "getVideoList: resolved[$i] quality=${resolved.quality} videoUrl=${resolved.videoUrl}")
-                            // KNS
                             logVideoDiagnostics(
                                 stage = "resolved",
                                 sourceQuality = video.quality,
                                 originalUrl = video.url,
                                 resolved = resolved,
                             )
-                            // KNS
                         }
+                        // KNS
                         resolvedVideos
                     } catch (e: Exception) {
+                        // KNS
                         Log.e(TAG, "getVideoList: resolver failed for url=${video.url} quality=${video.quality}", e)
+                        // KNS
                         emptyList()
                     }
                 }
             }.awaitAll().flatten().also {
+                // KNS
                 Log.d(TAG, "getVideoList: final resolved video count=${it.size}")
+                // KNS
             }
         }
     }
 
     private fun serverVideoResolver(url: String, quality: String): List<Video> {
+        // KNS
         Log.d(TAG, "serverVideoResolver: start quality=$quality url=$url")
+        // KNS
 
-        val resolved = when {
+        val resolvedVideos = when {
             url.contains("filemoon", ignoreCase = true) -> filemoonExtractor.videosFromUrl(url, "FileMoon")
             url.contains("streamtape", ignoreCase = true) -> streamtapeExtractor.videosFromUrl(url, "StreamTape")
             url.contains("mixdrop", ignoreCase = true) -> mixDropExtractor.videosFromUrl(url, "MixDrop")
@@ -287,33 +326,40 @@ class BLZone :
                 val cleanUrl = url.substringBefore("?")
                 pixelDrainExtractor.videosFromUrl(cleanUrl, "Pixel")
             }
-            // KNS
-            // KNS
             url.contains("mp4upload", ignoreCase = true) -> mp4uploadExtractor.videosFromUrl(url, headers)
+            url.contains("upns.online", ignoreCase = true) ->
+                upnShareExtractor.videosFromUrl(url, "UPnShare")
             // KNS
-            url.contains("p2pplay", ignoreCase = true) -> listOf(Video(url, "P2P", url))
-            url.contains("upns.online", ignoreCase = true) -> listOf(Video(url, "upnshare", url))
+            // KNS
+            url.contains("p2pplay.online", ignoreCase = true) ->
+                upnShareExtractor.videosFromUrl(url, "P2P")
+            // KNS
             else -> {
+                // KNS
                 Log.d(TAG, "serverVideoResolver: unsupported host quality=$quality url=$url")
+                // KNS
                 emptyList()
             }
         }
 
-        Log.d(TAG, "serverVideoResolver: end quality=$quality url=$url resolvedCount=${resolved.size}")
-        return resolved
-    }
-    private fun logVideoDiagnostics(stage: String, sourceQuality: String, originalUrl: String, resolved: Video) {
         // KNS
+        Log.d(TAG, "serverVideoResolver: end quality=$quality url=$url resolvedCount=${resolvedVideos.size}")
+        // KNS
+        return resolvedVideos
+    }
+
+    // KNS
+    private fun logVideoDiagnostics(stage: String, sourceQuality: String, originalUrl: String, resolved: Video) {
         val resolvedUrl = resolved.videoUrl ?: ""
         val lower = resolvedUrl.lowercase()
-        // KNS
+        val urlNoQuery = lower.substringBefore("?")
+        val headersCount = resolved.headers?.size ?: 0
 
-        val isMalformed = !resolvedUrl.startsWith("http://") && !resolvedUrl.startsWith("https://")
+        val isMalformed = resolvedUrl.isBlank() || (!resolvedUrl.startsWith("http://") && !resolvedUrl.startsWith("https://"))
         val hasFragment = resolvedUrl.contains("#")
         val fragmentOnlyPattern = resolvedUrl.contains("/#")
-        val looksDirectMedia = directMediaExtensions.any { lower.substringBefore("?").endsWith(it) } || lower.contains(".m3u8")
+        val looksDirectMedia = directMediaExtensions.any { urlNoQuery.endsWith(it) } || lower.contains(".m3u8")
         val looksHostPage = lower.contains("/e/") || lower.contains("/embed") || lower.contains("/u/")
-        val headersCount = resolved.headers!!.size
 
         Log.d(
             TAG,
@@ -335,6 +381,7 @@ class BLZone :
             Log.w(TAG, "videoDiag[$stage]: URL type unknown for player compatibility: $resolvedUrl")
         }
     }
+    // KNS
 
     override fun List<Video>.sort(): List<Video> {
         val preferredServer = preferences.getString(PREF_SERVER_KEY, PREF_SERVER_DEFAULT)!!

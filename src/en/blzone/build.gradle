@@ -1,7 +1,7 @@
 ext {
     extName = 'BLZone'
     extClass = '.BLZone'
-    extVersionCode = 7
+    extVersionCode = 8
     isNsfw = true
 }
 
@@ -12,8 +12,9 @@ dependencies {
     implementation(project(':lib:streamtapeextractor'))
     implementation(project(':lib:mixdropextractor'))
     implementation(project(':lib:vidguardextractor'))
-    // KNS
     implementation(project(':lib:pixeldrainextractor'))
     implementation(project(':lib:mp4uploadextractor'))
+    // KNS
+    implementation(project(':lib:upnshareextractor'))
     // KNS
 }
