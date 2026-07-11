@@ -264,51 +264,50 @@ class BLZone :
 
     // ---- GET VIDEO LIST ----
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        // KNS
         Log.d(TAG, "getVideoList: start episodeUrl=${episode.url}")
-        // KNS
 
         val response = client.newCall(GET(baseUrl + episode.url)).await()
         val videos = videoListParse(response)
 
-        // KNS
         Log.d(TAG, "getVideoList: videoListParse returned ${videos.size} candidates")
-        // KNS
 
         return coroutineScope {
             videos.map { video ->
                 async(Dispatchers.IO) {
                     try {
-                        // KNS
                         Log.d(TAG, "getVideoList: resolving url=${video.url} quality=${video.quality}")
-                        // KNS
                         val resolvedVideos = serverVideoResolver(video.url, video.quality)
-                        // KNS
-                        Log.d(TAG, "getVideoList: resolved ${resolvedVideos.size} videos from url=${video.url}")
-                        resolvedVideos.forEachIndexed { i, resolved ->
-                            Log.d(TAG, "getVideoList: resolved[$i] quality=${resolved.quality} videoUrl=${resolved.videoUrl}")
+
+                        resolvedVideos.mapNotNull { resolved ->
+                            // If the resolved video has no URL, skip it entirely
+                            val videoUrl = resolved.videoUrl ?: return@mapNotNull null
+                            val cleanName = cleanServerName(video.quality)
+
+                            val newVideo = Video(videoUrl, cleanName, resolved.url, headers = resolved.headers)
+
                             logVideoDiagnostics(
                                 stage = "resolved",
                                 sourceQuality = video.quality,
                                 originalUrl = video.url,
-                                resolved = resolved,
+                                resolved = newVideo,
                             )
+                            newVideo
                         }
-                        // KNS
-                        resolvedVideos
                     } catch (e: Exception) {
-                        // KNS
                         Log.e(TAG, "getVideoList: resolver failed for url=${video.url} quality=${video.quality}", e)
-                        // KNS
                         emptyList()
                     }
                 }
             }.awaitAll().flatten().also {
-                // KNS
                 Log.d(TAG, "getVideoList: final resolved video count=${it.size}")
-                // KNS
             }
         }
+    }
+
+    private fun cleanServerName(rawName: String): String {
+        val matched = SERVER_LIST.firstOrNull { rawName.contains(it, ignoreCase = true) } ?: rawName
+        // Explicitly fix "Filemoon" casing to "FileMoon" if matched
+        return if (matched.equals("Filemoon", ignoreCase = true)) "FileMoon" else matched
     }
 
     private fun serverVideoResolver(url: String, quality: String): List<Video> {
