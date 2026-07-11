@@ -26,7 +26,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -47,6 +51,7 @@ class BLZone :
     companion object {
         private const val PREF_SERVER_KEY = "preferred_server"
         private const val PREF_SERVER_DEFAULT = "P2P"
+
         private val SERVER_LIST = arrayOf(
             "StreamTape",
             "Pixel",
@@ -59,10 +64,19 @@ class BLZone :
         )
 
         private const val TAG = "BLZone"
-        private val directMediaExtensions = listOf(".m3u8", ".mp4", ".webm", ".mkv", ".mov", ".m4v")
+
+        private val directMediaExtensions = listOf(
+            ".m3u8",
+            ".mp4",
+            ".webm",
+            ".mkv",
+            ".mov",
+            ".m4v",
+        )
     }
 
     // ---- FILTERS ----
+
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter())
 
     private class TypeFilter :
@@ -75,367 +89,839 @@ class BLZone :
             ),
         )
 
-    open class UriPartFilter(displayName: String, private val vals: Array<Pair<String, String>>) : AnimeFilter.Select<String>(displayName, vals.map { it.first }.toTypedArray()) {
+    open class UriPartFilter(
+        displayName: String,
+        private val vals: Array<Pair<String, String>>,
+    ) : AnimeFilter.Select<String>(
+        displayName,
+        vals.map { it.first }.toTypedArray(),
+    ) {
         fun toUriPart() = vals[state].second
+
         fun isEmpty() = vals[state].second == ""
+
         fun isDefault() = state == 0
     }
 
     // ---- POPULAR ----
+
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/trending/", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage {
-        Log.d(TAG, "popularAnimeParse: HTTP ${response.code} for URL: ${response.request.url}")
+        Log.d(
+            TAG,
+            "popularAnimeParse: HTTP ${response.code} for ${response.request.url}",
+        )
+
         if (!response.isSuccessful) {
-            Log.e(TAG, "popularAnimeParse ERROR: Server returned HTTP status code ${response.code}")
+            Log.e(
+                TAG,
+                "popularAnimeParse: server returned HTTP ${response.code}",
+            )
         }
+
         val document = response.asJsoup()
-        val animeList = mutableListOf<SAnime>()
-        val elements = document.select("#dt-tvshows .item.tvshows, #dt-movies .item.tvshows")
-        Log.d(TAG, "popularAnimeParse: Found ${elements.size} popular anime layout items")
-        animeList.addAll(elements.map { popularAnimeFromElement(it) })
-        return AnimesPage(animeList, hasNextPage = false)
+
+        val animeList = document
+            .select("#dt-tvshows .item.tvshows, #dt-movies .item.tvshows")
+            .map(::popularAnimeFromElement)
+
+        Log.d(
+            TAG,
+            "popularAnimeParse: found ${animeList.size} entries",
+        )
+
+        return AnimesPage(
+            animes = animeList,
+            hasNextPage = false,
+        )
     }
 
     private fun popularAnimeFromElement(element: Element): SAnime {
         val anime = SAnime.create()
         val poster = element.selectFirst(".poster")
-        val link = poster?.selectFirst("a")?.attr("href")
-        if (link.isNullOrBlank()) {
-            Log.w(TAG, "popularAnimeFromElement: Absolute link missing or null for element title: ${element.selectFirst("h3 a")?.text()}")
+        val link = poster
+            ?.selectFirst("a")
+            ?.attr("href")
+            .orEmpty()
+
+        if (link.isBlank()) {
+            Log.w(
+                TAG,
+                "popularAnimeFromElement: missing link for " +
+                    element.selectFirst("h3 a")?.text(),
+            )
         }
-        val img = poster?.selectFirst("img")
-        anime.title = img?.attr("alt") ?: element.selectFirst("h3 a")?.text() ?: "No title"
-        anime.thumbnail_url = img?.attr("src")
-        anime.setUrlWithoutDomain(link.orEmpty())
+
+        val image = poster?.selectFirst("img")
+
+        anime.title = image?.attr("alt")
+            ?: element.selectFirst("h3 a")?.text()
+            ?: "No title"
+
+        anime.thumbnail_url = image?.attr("src")
+        anime.setUrlWithoutDomain(link)
+
         return anime
     }
 
     // ---- LATEST ----
+
     override fun latestUpdatesRequest(page: Int): Request {
-        val animePageUrl = if (page == 1) "$baseUrl/anime/" else "$baseUrl/anime/page/$page/"
-        return GET(animePageUrl, headers)
+        val url = if (page == 1) {
+            "$baseUrl/anime/"
+        } else {
+            "$baseUrl/anime/page/$page/"
+        }
+
+        return GET(url, headers)
     }
 
     override fun latestUpdatesParse(response: Response): AnimesPage {
-        Log.d(TAG, "latestUpdatesParse: HTTP ${response.code} for URL: ${response.request.url}")
+        Log.d(
+            TAG,
+            "latestUpdatesParse: HTTP ${response.code} for ${response.request.url}",
+        )
+
         if (!response.isSuccessful) {
-            Log.e(TAG, "latestUpdatesParse ERROR: Server returned HTTP status code ${response.code}")
+            Log.e(
+                TAG,
+                "latestUpdatesParse: server returned HTTP ${response.code}",
+            )
         }
+
         val document = response.asJsoup()
-        val animeList = document.select(".items.full .item.tvshows")
-            .map { latestAnimeFromElement(it) }.toMutableList()
+
+        val animeList = document
+            .select(".items.full .item.tvshows")
+            .map(::latestAnimeFromElement)
+            .toMutableList()
 
         if (response.request.url.encodedPath.endsWith("/anime/")) {
             runCatching {
-                Log.d(TAG, "latestUpdatesParse: Fetching supplementary dorama items...")
-                client.newCall(GET("$baseUrl/dorama/", headers)).execute().use { doramaResponse ->
-                    Log.d(TAG, "latestUpdatesParse (Dorama side-request): HTTP ${doramaResponse.code}")
+                client.newCall(
+                    GET("$baseUrl/dorama/", headers),
+                ).execute().use { doramaResponse ->
+                    Log.d(
+                        TAG,
+                        "latestUpdatesParse: dorama HTTP ${doramaResponse.code}",
+                    )
+
                     if (doramaResponse.isSuccessful) {
-                        val doramaElements = doramaResponse.asJsoup().select(".items.full .item.tvshows")
-                        Log.d(TAG, "latestUpdatesParse: Found ${doramaElements.size} dorama items to append")
-                        doramaElements.map { latestAnimeFromElement(it) }.let { animeList.addAll(it) }
-                    } else {
-                        Log.e(TAG, "latestUpdatesParse Dorama Fetch failed with HTTP code: ${doramaResponse.code}")
+                        doramaResponse
+                            .asJsoup()
+                            .select(".items.full .item.tvshows")
+                            .map(::latestAnimeFromElement)
+                            .let(animeList::addAll)
                     }
                 }
-            }.onFailure { e ->
-                Log.e(TAG, "latestUpdatesParse: Exception thrown during simultaneous dorama fetch pipeline", e)
+            }.onFailure { error ->
+                Log.e(
+                    TAG,
+                    "latestUpdatesParse: dorama request failed",
+                    error,
+                )
             }
         }
-        return AnimesPage(animeList, hasNextPage = hasNextPage(document))
+
+        return AnimesPage(
+            animes = animeList,
+            hasNextPage = hasNextPage(document),
+        )
     }
 
     private fun latestAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
 
-    private fun hasNextPage(document: Document): Boolean = document.selectFirst(".pagination .next:not(.disabled)") != null
+    private fun hasNextPage(document: Document): Boolean = document.selectFirst(
+        ".pagination .next:not(.disabled)",
+    ) != null
 
     // ---- SEARCH ----
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val typeFilter = filters.filterIsInstance<TypeFilter>().firstOrNull()
-        val url = baseUrl.toHttpUrl()
-            .newBuilder().apply {
-                if (typeFilter != null && !typeFilter.isDefault()) {
+
+    override fun searchAnimeRequest(
+        page: Int,
+        query: String,
+        filters: AnimeFilterList,
+    ): Request {
+        val typeFilter = filters
+            .filterIsInstance<TypeFilter>()
+            .firstOrNull()
+
+        val url = baseUrl
+            .toHttpUrl()
+            .newBuilder()
+            .apply {
+                if (
+                    typeFilter != null &&
+                    !typeFilter.isDefault()
+                ) {
                     addPathSegment(typeFilter.toUriPart())
                     addPathSegment("")
                 }
+
                 addQueryParameter("s", query.trim())
             }
             .build()
-        Log.d(TAG, "searchAnimeRequest: Generating search URL: $url with query: '$query'")
+
+        Log.d(
+            TAG,
+            "searchAnimeRequest: query='$query' url=$url",
+        )
+
         return GET(url.toString(), headers)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        Log.d(TAG, "searchAnimeParse: HTTP ${response.code} for search URL: ${response.request.url}")
-        if (!response.isSuccessful) {
-            Log.e(TAG, "searchAnimeParse ERROR: HTTP error code ${response.code}")
-        }
-        val document = response.asJsoup()
-        val targets = document.select(".search-page .result-item article")
-        Log.d(TAG, "searchAnimeParse: Found ${targets.size} raw search result records matching container")
-        val animeList = targets.map { searchAnimeFromElement(it) }
-        return AnimesPage(animeList, hasNextPage = false)
+        Log.d(
+            TAG,
+            "searchAnimeParse: HTTP ${response.code} for ${response.request.url}",
+        )
+
+        val animeList = response
+            .asJsoup()
+            .select(".search-page .result-item article")
+            .map(::searchAnimeFromElement)
+
+        return AnimesPage(
+            animes = animeList,
+            hasNextPage = false,
+        )
     }
 
     private fun searchAnimeFromElement(element: Element): SAnime {
         val anime = SAnime.create()
-        val img = element.selectFirst(".thumbnail img")
-        val link = element.selectFirst(".thumbnail a")?.attr("href")
-        if (link.isNullOrBlank()) {
-            Log.w(TAG, "searchAnimeFromElement: Target endpoint reference link missing entirely inside wrapper node structural layout")
-        }
-        anime.title = img?.attr("alt") ?: element.selectFirst(".title a")?.text() ?: "No title"
-        anime.thumbnail_url = img?.attr("src")
-        anime.setUrlWithoutDomain(link.orEmpty())
+        val image = element.selectFirst(".thumbnail img")
+        val link = element
+            .selectFirst(".thumbnail a")
+            ?.attr("href")
+            .orEmpty()
+
+        anime.title = image?.attr("alt")
+            ?: element.selectFirst(".title a")?.text()
+            ?: "No title"
+
+        anime.thumbnail_url = image?.attr("src")
+        anime.setUrlWithoutDomain(link)
+
         return anime
     }
 
     // ---- DETAILS ----
+
     override fun animeDetailsParse(response: Response): SAnime {
-        Log.d(TAG, "animeDetailsParse: HTTP ${response.code} processing payload info specs details from: ${response.request.url}")
-        if (!response.isSuccessful) {
-            Log.e(TAG, "animeDetailsParse FAILED: Code ${response.code} (e.g. 404 Not Found / 403 Forbidden)")
-        }
+        Log.d(
+            TAG,
+            "animeDetailsParse: HTTP ${response.code} for ${response.request.url}",
+        )
+
         val document = response.asJsoup()
         val anime = SAnime.create()
         val poster = document.selectFirst(".sheader .poster img")
-        (document.selectFirst(".sheader .data h1")?.text() ?: poster?.attr("alt"))?.let {
-            anime.title = it
-        }
-        anime.thumbnail_url = poster?.attr("src")
-        anime.genre = document.select(".sheader .sgeneros a").joinToString { it.text() }
-        val desc = document.selectFirst(".sbox .wp-content p")?.text()?.takeIf { it.isNotBlank() }
-        val altTitle = document.selectFirst(".custom_fields b.variante:contains(Original Title) + span.valor")?.text()?.takeIf { it.isNotBlank() }
-        anime.description = listOfNotNull(desc, altTitle).joinToString("\n\n").ifBlank { "No description available." }
 
-        Log.d(TAG, "animeDetailsParse Completed processing: Title='${anime.title}', Genres='${anime.genre}'")
+        anime.title = document
+            .selectFirst(".sheader .data h1")
+            ?.text()
+            ?: poster?.attr("alt")
+            ?: "No title"
+
+        anime.thumbnail_url = poster?.attr("src")
+
+        anime.genre = document
+            .select(".sheader .sgeneros a")
+            .joinToString { it.text() }
+
+        val description = document
+            .selectFirst(".sbox .wp-content p")
+            ?.text()
+            ?.takeIf { it.isNotBlank() }
+
+        val alternativeTitle = document
+            .selectFirst(
+                ".custom_fields b.variante:contains(Original Title) + span.valor",
+            )
+            ?.text()
+            ?.takeIf { it.isNotBlank() }
+
+        anime.description = listOfNotNull(
+            description,
+            alternativeTitle,
+        ).joinToString("\n\n")
+            .ifBlank { "No description available." }
+
         return anime
     }
 
     // ---- EPISODES ----
-    override fun episodeListParse(response: Response): List<SEpisode> {
-        Log.d(TAG, "episodeListParse: HTTP status returned = ${response.code} for path: ${response.request.url}")
-        if (!response.isSuccessful) {
-            Log.e(TAG, "episodeListParse Critical Warning: HTTP response failed with status code ${response.code}")
-        }
-        val document = response.asJsoup()
-        val rawEpisodes = document.select("#episodes ul.episodios2 > li")
-        Log.d(TAG, "episodeListParse: Located ${rawEpisodes.size} listing items matching selector target structural rule")
-        if (rawEpisodes.isEmpty()) {
-            Log.w(TAG, "episodeListParse WARNING: No items fetched from DOM container #episodes ul.episodios2 > li. Is the content restricted or changed?")
-        }
-        return rawEpisodes.map { episodeFromElement(it) }.reversed()
+
+    override fun episodeListParse(
+        response: Response,
+    ): List<SEpisode> {
+        Log.d(
+            TAG,
+            "episodeListParse: HTTP ${response.code} for ${response.request.url}",
+        )
+
+        val elements = response
+            .asJsoup()
+            .select("#episodes ul.episodios2 > li")
+
+        Log.d(
+            TAG,
+            "episodeListParse: found ${elements.size} episodes",
+        )
+
+        return elements
+            .map(::episodeFromElement)
+            .reversed()
     }
 
-    private val episodeNumRegex = Regex("""Episode (\d+)""", RegexOption.IGNORE_CASE)
+    private val episodeNumRegex = Regex(
+        """Episode (\d+)""",
+        RegexOption.IGNORE_CASE,
+    )
 
     private fun episodeFromElement(element: Element): SEpisode {
-        val ep = SEpisode.create()
-        val link = element.selectFirst(".episodiotitle a")?.attr("href")
-        if (link.isNullOrBlank()) {
-            Log.e(TAG, "episodeFromElement Error: Underlying reference hyperlink tag href key attribute mapping is null or dead empty.")
-        }
-        ep.setUrlWithoutDomain(link.orEmpty())
-        ep.name = element.selectFirst(".episodiotitle a")?.text() ?: "Episode"
-        val episodeNum = episodeNumRegex.find(ep.name)?.groupValues?.getOrNull(1)
-        episodeNum?.toFloatOrNull()?.let { ep.episode_number = it }
-        return ep
+        val episode = SEpisode.create()
+
+        val linkElement = element.selectFirst(
+            ".episodiotitle a",
+        )
+
+        episode.setUrlWithoutDomain(
+            linkElement?.attr("href").orEmpty(),
+        )
+
+        episode.name = linkElement?.text() ?: "Episode"
+
+        episodeNumRegex
+            .find(episode.name)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toFloatOrNull()
+            ?.let {
+                episode.episode_number = it
+            }
+
+        return episode
     }
 
     // ---- VIDEO EXTRACTORS ----
-    private val filemoonExtractor by lazy { FilemoonExtractor(client) }
-    private val streamtapeExtractor by lazy { StreamTapeExtractor(client) }
-    private val mixDropExtractor by lazy { MixDropExtractor(client) }
-    private val vidGuardExtractor by lazy { VidGuardExtractor(client) }
-    private val pixelDrainExtractor by lazy { PixelDrainExtractor() }
-    private val mp4uploadExtractor by lazy { Mp4uploadExtractor(client) }
-    private val upnShareExtractor by lazy { UPnShareExtractor(client) }
+
+    private val filemoonExtractor by lazy {
+        FilemoonExtractor(client)
+    }
+
+    private val streamtapeExtractor by lazy {
+        StreamTapeExtractor(client)
+    }
+
+    private val mixDropExtractor by lazy {
+        MixDropExtractor(client)
+    }
+
+    private val vidGuardExtractor by lazy {
+        VidGuardExtractor(client)
+    }
+
+    private val pixelDrainExtractor by lazy {
+        PixelDrainExtractor()
+    }
+
+    private val mp4uploadExtractor by lazy {
+        Mp4uploadExtractor(client)
+    }
+
+    private val upnShareExtractor by lazy {
+        UPnShareExtractor(client)
+    }
+
+    /*
+     * UPnShare and P2PPlay use the same API family.
+     *
+     * Resolve them one at a time so two simultaneous requests do not
+     * interfere with each other or trigger transient empty responses.
+     */
+    private val upnFamilyMutex = Mutex()
 
     // ---- VIDEO LIST PARSE ----
-    override fun videoListParse(response: Response): List<Video> {
-        Log.d(TAG, "videoListParse: HTTP status code code=${response.code} validation for url context: ${response.request.url}")
+
+    override fun videoListParse(
+        response: Response,
+    ): List<Video> {
+        Log.d(
+            TAG,
+            "videoListParse: HTTP ${response.code} for ${response.request.url}",
+        )
+
         if (!response.isSuccessful) {
-            Log.e(TAG, "videoListParse: HTTP ERROR encountered! Status code received: ${response.code}. Content may be blocked/missing.")
+            Log.e(
+                TAG,
+                "videoListParse: page returned HTTP ${response.code}",
+            )
         }
 
         val document = response.asJsoup()
-        val serverNames = document.select("#playeroptionsul li span.title").map { it.text().trim() }
-        val serverBoxes = document.select(".dooplay_player .source-box").drop(1)
 
-        Log.d(TAG, "videoListParse: Extracted system tracking dimensions: serverNames.size=${serverNames.size}, serverBoxes.size=${serverBoxes.size}")
+        val serverNames = document
+            .select("#playeroptionsul li span.title")
+            .map { it.text().trim() }
 
-        if (serverNames.isEmpty() || serverBoxes.isEmpty()) {
-            Log.w(TAG, "videoListParse: DOM Selectors mismatch or layout void! Zero matches discovered on structural markup nodes paths.")
-        }
+        val serverBoxes = document
+            .select(".dooplay_player .source-box")
+            .drop(1)
+
+        Log.d(
+            TAG,
+            "videoListParse: serverNames=${serverNames.size} " +
+                "serverBoxes=${serverBoxes.size}",
+        )
 
         return serverBoxes.mapIndexedNotNull { index, box ->
             val rawServerName = serverNames.getOrNull(index)
-            if (rawServerName == null) {
-                Log.w(TAG, "videoListParse: Missing corresponding element inside label mappings array index tracking point context node index=$index")
+                ?: return@mapIndexedNotNull null
+
+            val serverName = SERVER_LIST.firstOrNull {
+                rawServerName.contains(
+                    other = it,
+                    ignoreCase = true,
+                )
+            } ?: rawServerName
+
+            val iframeUrl = box
+                .selectFirst("iframe.metaframe")
+                ?.attr("src")
+                ?.trim()
+                .orEmpty()
+
+            if (iframeUrl.isBlank()) {
+                Log.d(
+                    TAG,
+                    "videoListParse: blank iframe " +
+                        "index=$index server=$serverName",
+                )
                 return@mapIndexedNotNull null
             }
 
-            val matchedServerName = SERVER_LIST.firstOrNull { rawServerName.contains(it, ignoreCase = true) } ?: rawServerName
-            val iframe = box.selectFirst("iframe.metaframe")
-            val src = iframe?.attr("src")?.trim().orEmpty()
-
-            if (src.isBlank()) {
-                Log.d(TAG, "videoListParse: Skipped blank frame source location reference tracking pointer context key coordinate at index=$index label=$matchedServerName [Raw label='$rawServerName']")
-                return@mapIndexedNotNull null
-            }
-
-            val videoUrl = if (src.contains("/diclaimer/?url=")) {
+            val resolvedUrl = if (
+                iframeUrl.contains("/diclaimer/?url=")
+            ) {
                 runCatching {
-                    java.net.URLDecoder.decode(src.substringAfter("/diclaimer/?url="), StandardCharsets.UTF_8.name())
-                }.getOrElse { e ->
-                    Log.e(TAG, "videoListParse failed URL decode resolution step processing parameter input: $src", e)
-                    src
+                    java.net.URLDecoder.decode(
+                        iframeUrl.substringAfter(
+                            "/diclaimer/?url=",
+                        ),
+                        StandardCharsets.UTF_8.name(),
+                    )
+                }.getOrElse { error ->
+                    Log.e(
+                        TAG,
+                        "videoListParse: failed to decode $iframeUrl",
+                        error,
+                    )
+                    iframeUrl
                 }
             } else {
-                src
+                iframeUrl
             }
 
-            Log.d(TAG, "videoListParse Successfully Indexed node structural map coordinates: index=$index resolvedTargetHostName=$matchedServerName sourceRouteString=$videoUrl")
-            Video(videoUrl, matchedServerName, videoUrl)
-        }.also {
-            Log.d(TAG, "videoListParse complete checklist operations. Generated aggregate matching parse records array size counts total: ${it.size} candidates")
+            Log.d(
+                TAG,
+                "videoListParse: index=$index " +
+                    "server=$serverName url=$resolvedUrl",
+            )
+
+            Video(
+                url = resolvedUrl,
+                quality = serverName,
+                videoUrl = resolvedUrl,
+            )
+        }.also { candidates ->
+            Log.d(
+                TAG,
+                "videoListParse: candidates=${candidates.size}",
+            )
         }
     }
 
     // ---- GET VIDEO LIST ----
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        Log.d(TAG, "getVideoList Invocation Initiated: Target relative subpath execution coordinate locator: target=${episode.url}")
 
-        val response = try {
-            client.newCall(GET(baseUrl + episode.url)).await()
-        } catch (e: Exception) {
-            Log.e(TAG, "getVideoList CRITICAL METRIC INTERRUPT: Network level exception was thrown when executing base fetch request call to endpoint: ${baseUrl + episode.url}", e)
+    override suspend fun getVideoList(
+        episode: SEpisode,
+    ): List<Video> {
+        Log.d(
+            TAG,
+            "getVideoList: start episodeUrl=${episode.url}",
+        )
+
+        val response = runCatching {
+            client.newCall(
+                GET(baseUrl + episode.url),
+            ).await()
+        }.getOrElse { error ->
+            Log.e(
+                TAG,
+                "getVideoList: failed to request " +
+                    (baseUrl + episode.url),
+                error,
+            )
             return emptyList()
         }
 
-        Log.d(TAG, "getVideoList: Main source page network request responded with HTTP status code code=${response.code}")
-        if (response.code == 404) {
-            Log.e(TAG, "getVideoList ERROR: Page non-existent! Received 404 for ${episode.url}")
-        } else if (response.code == 403) {
-            Log.e(TAG, "getVideoList ERROR: Access Denied! Received 403 for ${episode.url} (Check Cloudflare protection changes)")
+        Log.d(
+            TAG,
+            "getVideoList: episode page HTTP ${response.code}",
+        )
+
+        if (!response.isSuccessful) {
+            Log.e(
+                TAG,
+                "getVideoList: episode page failed with " +
+                    "HTTP ${response.code}",
+            )
+            return emptyList()
         }
 
-        val videos = videoListParse(response)
-        Log.d(TAG, "getVideoList pipeline process checkpoint: target elements validation array count total size = ${videos.size} items passed to resolver routing loop layer")
+        val candidates = videoListParse(response)
+
+        Log.d(
+            TAG,
+            "getVideoList: resolving ${candidates.size} candidates",
+        )
 
         return coroutineScope {
-            videos.map { video ->
+            candidates.map { candidate ->
                 async(Dispatchers.IO) {
-                    try {
-                        Log.d(TAG, "getVideoList [Asynchronous Dispatch Loop Handler]: Triggering decryption extractor processing routing mapping criteria logic on route parameter location: hostName='${video.quality}', endpointSource='${video.url}'")
-                        val resolvedVideos = serverVideoResolver(video.url, video.quality)
+                    runCatching {
+                        Log.d(
+                            TAG,
+                            "getVideoList: resolving " +
+                                "server=${candidate.quality} " +
+                                "url=${candidate.url}",
+                        )
 
-                        Log.d(TAG, "getVideoList [Extractor Resolver Callback Matrix]: Engine completed operations. Returned output items count size tracking variable dimension = ${resolvedVideos.size} nodes for '${video.quality}'")
+                        val resolvedVideos = serverVideoResolver(
+                            url = candidate.url,
+                            quality = candidate.quality,
+                        )
+
+                        Log.d(
+                            TAG,
+                            "getVideoList: server=${candidate.quality} " +
+                                "results=${resolvedVideos.size}",
+                        )
 
                         resolvedVideos.mapNotNull { resolved ->
-                            val videoUrl = resolved.videoUrl
-                            if (videoUrl.isNullOrBlank()) {
-                                Log.w(TAG, "getVideoList Extractor Execution Discard: Extractor parsing handler execution structure passed back null/empty playable direct video links parameter attributes from underlying frame payload parsing operations logic for server element target '${video.quality}'")
+                            /*
+                             * videoUrl is the actual playable media URL.
+                             *
+                             * Reject malformed results such as:
+                             * https:MDCore.31=
+                             */
+                            val directUrl = resolved.videoUrl
+                                ?.trim()
+                                ?.takeIf(::isValidHttpUrl)
+
+                            if (directUrl == null) {
+                                Log.w(
+                                    TAG,
+                                    "getVideoList: discarding malformed " +
+                                        "result server=${candidate.quality} " +
+                                        "videoUrl=${resolved.videoUrl}",
+                                )
                                 return@mapNotNull null
                             }
-                            val cleanName = cleanServerName(video.quality)
-                            val newVideo = Video(videoUrl, cleanName, resolved.url, headers = resolved.headers)
+
+                            /*
+                             * Keep the extractor URL when it is valid.
+                             * Otherwise use the playable media URL.
+                             */
+                            val sourceUrl = resolved.url
+                                .trim()
+                                .takeIf(::isValidHttpUrl)
+                                ?: directUrl
+
+                            val finalVideo = Video(
+                                url = sourceUrl,
+                                quality = cleanServerName(
+                                    candidate.quality,
+                                ),
+                                videoUrl = directUrl,
+                                headers = resolved.headers,
+                            )
 
                             logVideoDiagnostics(
-                                stage = "Resolution Verification Validation Pipeline Execution Stage",
-                                sourceQuality = video.quality,
-                                originalUrl = video.url,
-                                resolved = newVideo,
+                                stage = "resolved",
+                                sourceQuality = candidate.quality,
+                                originalUrl = candidate.url,
+                                resolved = finalVideo,
                             )
-                            newVideo
+
+                            finalVideo
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "getVideoList EXCEPTION FAILURE inside asynchronous parsing loop sequence thread routine mapping: failed runtime conversion handling parsing criteria logic execution for target processing locator configurations parameters -> hostLabelName='${video.quality}', absoluteSrcLocatorUrl='${video.url}'", e)
+                    }.getOrElse { error ->
+                        Log.e(
+                            TAG,
+                            "getVideoList: resolver failed " +
+                                "server=${candidate.quality} " +
+                                "url=${candidate.url}",
+                            error,
+                        )
                         emptyList()
                     }
                 }
-            }.awaitAll().flatten().also {
-                Log.i(TAG, "getVideoList COMPLETED ENTIRE STREAM SYSTEM PIPELINE: Final compiled displayable video playback assets object instance payload collection total elements size count = ${it.size}")
-                if (it.isEmpty()) {
-                    Log.e(TAG, "getVideoList CRITICAL WARNING: Compiled video collection result payload structure mapping contains 0 active playable file entries! The user will experience a blank source player state screen error display anomaly.")
+            }.awaitAll()
+                .flatten()
+                .also { resolved ->
+                    Log.i(
+                        TAG,
+                        "getVideoList: final resolved " +
+                            "count=${resolved.size}",
+                    )
                 }
-            }
         }
     }
 
-    private fun cleanServerName(rawName: String): String {
-        val matched = SERVER_LIST.firstOrNull { rawName.contains(it, ignoreCase = true) } ?: rawName
-        return if (matched.equals("Filemoon", ignoreCase = true)) "FileMoon" else matched
+    private fun isValidHttpUrl(value: String): Boolean {
+        val parsed = value.toHttpUrlOrNull()
+            ?: return false
+
+        return parsed.scheme == "http" ||
+            parsed.scheme == "https"
     }
 
-    private fun serverVideoResolver(url: String, quality: String): List<Video> {
-        Log.d(TAG, "serverVideoResolver routing matching check processing engine run logic: identificationLabelStringKey='$quality' routeSourceUrl='$url'")
+    private fun cleanServerName(
+        rawName: String,
+    ): String {
+        val matched = SERVER_LIST.firstOrNull {
+            rawName.contains(
+                other = it,
+                ignoreCase = true,
+            )
+        } ?: rawName
+
+        return if (
+            matched.equals(
+                other = "Filemoon",
+                ignoreCase = true,
+            )
+        ) {
+            "FileMoon"
+        } else {
+            matched
+        }
+    }
+
+    private suspend fun serverVideoResolver(
+        url: String,
+        quality: String,
+    ): List<Video> {
+        Log.d(
+            TAG,
+            "serverVideoResolver: quality=$quality url=$url",
+        )
 
         return runCatching {
             when {
-                url.contains("filemoon", ignoreCase = true) -> filemoonExtractor.videosFromUrl(url, "FileMoon")
-                url.contains("streamtape", ignoreCase = true) -> streamtapeExtractor.videosFromUrl(url, "StreamTape")
-                url.contains("mixdrop", ignoreCase = true) -> mixDropExtractor.videosFromUrl(url, "MixDrop")
-                url.contains("vgembed", ignoreCase = true) -> vidGuardExtractor.videosFromUrl(url, "VidGuard")
-                url.contains("pixeldrain", ignoreCase = true) -> {
-                    val cleanUrl = url.substringBefore("?")
-                    pixelDrainExtractor.videosFromUrl(cleanUrl, "Pixel")
+                url.contains(
+                    "filemoon",
+                    ignoreCase = true,
+                ) -> {
+                    filemoonExtractor.videosFromUrl(
+                        url,
+                        "FileMoon",
+                    )
                 }
-                url.contains("mp4upload", ignoreCase = true) -> mp4uploadExtractor.videosFromUrl(url, headers)
-                url.contains("upns.online", ignoreCase = true) -> upnShareExtractor.videosFromUrl(url, "UPnShare")
-                url.contains("p2pplay.online", ignoreCase = true) -> upnShareExtractor.videosFromUrl(url, "P2P")
+
+                url.contains(
+                    "streamtape",
+                    ignoreCase = true,
+                ) -> {
+                    streamtapeExtractor.videosFromUrl(
+                        url,
+                        "StreamTape",
+                    )
+                }
+
+                url.contains(
+                    "mixdrop",
+                    ignoreCase = true,
+                ) -> {
+                    mixDropExtractor.videosFromUrl(
+                        url,
+                        "MixDrop",
+                    )
+                }
+
+                url.contains(
+                    "vgembed",
+                    ignoreCase = true,
+                ) -> {
+                    vidGuardExtractor.videosFromUrl(
+                        url,
+                        "VidGuard",
+                    )
+                }
+
+                url.contains(
+                    "pixeldrain",
+                    ignoreCase = true,
+                ) -> {
+                    pixelDrainExtractor.videosFromUrl(
+                        url = url.substringBefore("?"),
+                        prefix = "Pixel",
+                    )
+                }
+
+                url.contains(
+                    "mp4upload",
+                    ignoreCase = true,
+                ) -> {
+                    mp4uploadExtractor.videosFromUrl(
+                        url,
+                        headers,
+                    )
+                }
+
+                url.contains(
+                    "upns.online",
+                    ignoreCase = true,
+                ) -> {
+                    resolveUpnFamily(
+                        url = url,
+                        prefix = "UPnShare",
+                    )
+                }
+
+                url.contains(
+                    "p2pplay.online",
+                    ignoreCase = true,
+                ) -> {
+                    resolveUpnFamily(
+                        url = url,
+                        prefix = "P2P",
+                    )
+                }
+
                 else -> {
-                    Log.w(TAG, "serverVideoResolver NO COMPATIBLE MATCH FOUND: Host signature signature does not correspond to any known/linked engine extractor routines mapping profiles. Context verification checks parameters payload elements parameters metrics -> qualityDescriptorLabel='$quality', requestReferenceLinkString='$url'")
+                    Log.w(
+                        TAG,
+                        "serverVideoResolver: unsupported " +
+                            "quality=$quality url=$url",
+                    )
                     emptyList()
                 }
             }
-        }.getOrElse { e ->
-            Log.e(TAG, "serverVideoResolver EXCEPTION INTERRUPT: Internal error caught inside core third party engine extractor module pipeline wrapper while scanning host string reference patterns -> destinationLabelIdentifier='$quality', trackingLocatorUrlReference='$url'", e)
+        }.getOrElse { error ->
+            Log.e(
+                TAG,
+                "serverVideoResolver: failed " +
+                    "quality=$quality url=$url",
+                error,
+            )
             emptyList()
         }
     }
 
-    private fun logVideoDiagnostics(stage: String, sourceQuality: String, originalUrl: String, resolved: Video) {
-        val resolvedUrl = resolved.videoUrl ?: ""
-        val lower = resolvedUrl.lowercase()
-        val urlNoQuery = lower.substringBefore("?")
-        val headersCount = resolved.headers?.size ?: 0
+    private suspend fun resolveUpnFamily(
+        url: String,
+        prefix: String,
+    ): List<Video> = upnFamilyMutex.withLock {
+        var resolved = emptyList<Video>()
 
-        val isMalformed = resolvedUrl.isBlank() || (!resolvedUrl.startsWith("http://") && !resolvedUrl.startsWith("https://"))
-        val hasFragment = resolvedUrl.contains("#")
-        val fragmentOnlyPattern = resolvedUrl.contains("/#")
-        val looksDirectMedia = directMediaExtensions.any { urlNoQuery.endsWith(it) } || lower.contains(".m3u8")
-        val looksHostPage = lower.contains("/e/") || lower.contains("/embed") || lower.contains("/u/")
+        for (attempt in 1..3) {
+            resolved = upnShareExtractor.videosFromUrl(
+                url = url,
+                prefix = prefix,
+            )
+
+            Log.d(
+                TAG,
+                "resolveUpnFamily: server=$prefix " +
+                    "attempt=$attempt " +
+                    "resultCount=${resolved.size}",
+            )
+
+            if (resolved.isNotEmpty()) {
+                break
+            }
+
+            if (attempt < 3) {
+                delay(250L * attempt)
+            }
+        }
+
+        resolved
+    }
+
+    private fun logVideoDiagnostics(
+        stage: String,
+        sourceQuality: String,
+        originalUrl: String,
+        resolved: Video,
+    ) {
+        val resolvedUrl = resolved.videoUrl.orEmpty()
+        val lowerUrl = resolvedUrl.lowercase()
+        val urlWithoutQuery = lowerUrl.substringBefore("?")
+        val headerCount = resolved.headers?.size ?: 0
+
+        val malformed = !isValidHttpUrl(resolvedUrl)
+
+        val directMedia =
+            directMediaExtensions.any {
+                urlWithoutQuery.endsWith(it)
+            } ||
+                lowerUrl.contains(".m3u8")
+
+        val hostPage =
+            lowerUrl.contains("/e/") ||
+                lowerUrl.contains("/embed") ||
+                lowerUrl.contains("/u/")
 
         Log.d(
             TAG,
-            "videoDiag[$stage]: sourceQuality=$sourceQuality resolvedQuality=${resolved.quality} " +
-                "malformed=$isMalformed directMedia=$looksDirectMedia hostPage=$looksHostPage " +
-                "hasFragment=$hasFragment fragmentOnly=$fragmentOnlyPattern headersCount=$headersCount " +
-                "originalUrl=$originalUrl resolvedUrl=$resolvedUrl",
+            "videoDiag[$stage]: " +
+                "sourceQuality=$sourceQuality " +
+                "resolvedQuality=${resolved.quality} " +
+                "malformed=$malformed " +
+                "directMedia=$directMedia " +
+                "hostPage=$hostPage " +
+                "headersCount=$headerCount " +
+                "originalUrl=$originalUrl " +
+                "resolvedUrl=$resolvedUrl",
         )
 
-        if (isMalformed) {
-            Log.w(TAG, "videoDiag[$stage]: MALFORMED resolved URL (likely unplayable stream string value parsing error): $resolvedUrl")
-        }
-        if (fragmentOnlyPattern) {
-            Log.w(TAG, "videoDiag[$stage]: URL contains static runtime token fragment dependencies token strings signature parameters references (#...), extraction parsing script structural mapping properties are incomplete or mismatched: $resolvedUrl")
-        }
-        if (!looksDirectMedia && !looksHostPage && !isMalformed) {
-            Log.w(TAG, "videoDiag[$stage]: URL validation typing status flag warning context state: unverified media asset file format layout configuration footprint compatibility for player standard pipelines: $resolvedUrl")
+        if (malformed) {
+            Log.w(
+                TAG,
+                "videoDiag[$stage]: malformed URL: $resolvedUrl",
+            )
         }
     }
 
     override fun List<Video>.sort(): List<Video> {
-        val preferredServer = preferences.getString(PREF_SERVER_KEY, PREF_SERVER_DEFAULT)!!
-        Log.d(TAG, "sort: Ordering resolved playlist items using user engine settings reference selection parameter key criteria = '$preferredServer'")
-        return this.sortedWith(
-            compareByDescending { it.quality.contains(preferredServer, ignoreCase = true) },
+        val preferredServer = preferences.getString(
+            PREF_SERVER_KEY,
+            PREF_SERVER_DEFAULT,
+        ) ?: PREF_SERVER_DEFAULT
+
+        Log.d(
+            TAG,
+            "sort: preferredServer=$preferredServer",
+        )
+
+        return sortedWith(
+            compareByDescending {
+                it.quality.contains(
+                    preferredServer,
+                    ignoreCase = true,
+                )
+            },
         )
     }
 
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+    override fun setupPreferenceScreen(
+        screen: PreferenceScreen,
+    ) {
         ListPreference(screen.context).apply {
             key = PREF_SERVER_KEY
             title = "Preferred server"
