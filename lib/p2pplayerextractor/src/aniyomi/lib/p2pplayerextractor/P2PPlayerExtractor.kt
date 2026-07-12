@@ -68,62 +68,34 @@ class P2PPlayerExtractor(
         val referer = "$baseUrl/"
 
         val apiHeaders = Headers.Builder()
-            .add(
-                "User-Agent",
-                USER_AGENT,
-            )
+            .add("User-Agent", USER_AGENT)
             .add(
                 "Accept",
                 "application/json, text/plain, */*",
             )
-            .add(
-                "Referer",
-                referer,
-            )
-            .add(
-                "Origin",
-                baseUrl,
-            )
+            .add("Referer", referer)
+            .add("Origin", baseUrl)
+            .build()
+
+        val masterHeaders = Headers.Builder()
+            .add("User-Agent", USER_AGENT)
+            .add("Accept", "*/*")
+            .add("Referer", referer)
+            .add("Origin", baseUrl)
             .build()
 
         val playbackHeaders = Headers.Builder()
-            .add(
-                "User-Agent",
-                USER_AGENT,
-            )
-            .add(
-                "Accept",
-                "*/*",
-            )
-            .add(
-                "Referer",
-                referer,
-            )
-            .add(
-                "Origin",
-                baseUrl,
-            )
+            .add("User-Agent", USER_AGENT)
+            .add("Referer", referer)
             .build()
 
         val apiUrl = baseHttpUrl
             .newBuilder()
             .addPathSegments("api/v1/video")
-            .addQueryParameter(
-                "id",
-                token,
-            )
-            .addQueryParameter(
-                "w",
-                "1920",
-            )
-            .addQueryParameter(
-                "h",
-                "1200",
-            )
-            .addQueryParameter(
-                "r",
-                "",
-            )
+            .addQueryParameter("id", token)
+            .addQueryParameter("w", "1920")
+            .addQueryParameter("h", "1200")
+            .addQueryParameter("r", "")
             .build()
 
         val responseText = requestText(
@@ -131,10 +103,10 @@ class P2PPlayerExtractor(
             headers = apiHeaders,
         ) ?: return emptyList()
 
-        val decodedPayload = decodeResponse(responseText)
+        val decryptedPayload = decodeResponse(responseText)
             ?: return emptyList()
 
-        val streamUrl = extractStreamUrl(decodedPayload)
+        val streamUrl = extractStreamUrl(decryptedPayload)
             ?: return emptyList()
 
         if (
@@ -159,7 +131,7 @@ class P2PPlayerExtractor(
             playlistUtils.extractFromHls(
                 playlistUrl = streamUrl,
                 referer = referer,
-                masterHeaders = playbackHeaders,
+                masterHeaders = masterHeaders,
                 videoHeaders = playbackHeaders,
                 videoNameGen = { quality ->
                     quality
@@ -179,16 +151,11 @@ class P2PPlayerExtractor(
         }
 
         return extractedVideos.mapNotNull { video ->
-            val playableUrl = video.videoUrl
+            val videoUrl = video.videoUrl
                 ?.trim()
                 ?.takeIf {
                     it.isNotBlank()
                 }
-                ?: video.url
-                    .trim()
-                    .takeIf {
-                        it.isNotBlank()
-                    }
                 ?: return@mapNotNull null
 
             val sourceUrl = video.url
@@ -196,7 +163,7 @@ class P2PPlayerExtractor(
                 .takeIf {
                     it.isNotBlank()
                 }
-                ?: playableUrl
+                ?: videoUrl
 
             Video(
                 url = sourceUrl,
@@ -204,7 +171,7 @@ class P2PPlayerExtractor(
                     prefix = prefix,
                     quality = video.quality,
                 ),
-                videoUrl = playableUrl,
+                videoUrl = videoUrl,
                 headers = playbackHeaders,
                 subtitleTracks = video.subtitleTracks,
                 audioTracks = video.audioTracks,
@@ -237,13 +204,15 @@ class P2PPlayerExtractor(
             client.newCall(request)
                 .execute()
                 .use { response ->
-                    if (!response.isSuccessful) {
-                        return@use null
-                    }
-
-                    response.body
+                    val body = response.body
                         .string()
                         .trim()
+
+                    if (response.isSuccessful) {
+                        body
+                    } else {
+                        null
+                    }
                 }
         }.getOrNull()
     }
@@ -261,7 +230,8 @@ class P2PPlayerExtractor(
         }
 
         val encryptedHex = when {
-            normalized.isValidHex() -> normalized
+            normalized.isValidHex() ->
+                normalized
 
             else ->
                 HEX_PAYLOAD_REGEX
@@ -331,27 +301,32 @@ class P2PPlayerExtractor(
         prefix: String,
         quality: String,
     ): String {
-        val cleaned = quality.trim()
+        val cleanedQuality = quality.trim()
 
         return when {
-            cleaned.isBlank() -> prefix
+            cleanedQuality.isBlank() ->
+                prefix
 
-            cleaned.equals(
+            cleanedQuality.equals(
                 "Video",
                 ignoreCase = true,
-            ) -> prefix
+            ) ->
+                prefix
 
-            cleaned.equals(
+            cleanedQuality.equals(
                 prefix,
                 ignoreCase = true,
-            ) -> prefix
+            ) ->
+                prefix
 
-            cleaned.startsWith(
+            cleanedQuality.startsWith(
                 prefix,
                 ignoreCase = true,
-            ) -> cleaned
+            ) ->
+                cleanedQuality
 
-            else -> "$prefix - $cleaned"
+            else ->
+                "$prefix - $cleanedQuality"
         }
     }
 
@@ -364,13 +339,6 @@ class P2PPlayerExtractor(
 
     private fun String.hexToByteArray(): ByteArray {
         require(length % 2 == 0)
-
-        require(
-            all {
-                it.isDigit() ||
-                    it.lowercaseChar() in 'a'..'f'
-            },
-        )
 
         return ByteArray(length / 2) { index ->
             val start = index * 2

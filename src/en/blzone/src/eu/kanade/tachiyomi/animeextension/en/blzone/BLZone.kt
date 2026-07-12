@@ -26,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -35,6 +36,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class BLZone :
@@ -71,7 +73,6 @@ class BLZone :
     }
 
     private data class ResolvedCandidate(
-        val serverName: String,
         val elapsedNanoseconds: Long,
         val videos: List<Video>,
     )
@@ -169,10 +170,7 @@ class BLZone :
             "$baseUrl/anime/page/$page/"
         }
 
-        return GET(
-            url,
-            headers,
-        )
+        return GET(url, headers)
     }
 
     override fun latestUpdatesParse(
@@ -249,7 +247,6 @@ class BLZone :
                     addPathSegment(
                         typeFilter.toUriPart(),
                     )
-
                     addPathSegment("")
                 }
 
@@ -286,6 +283,7 @@ class BLZone :
         element: Element,
     ): SAnime {
         val anime = SAnime.create()
+
         val image = element.selectFirst(
             ".thumbnail img",
         )
@@ -566,9 +564,6 @@ class BLZone :
             return emptyList()
         }
 
-        /*
-         * Every server starts at the same time.
-         */
         val resolvedCandidates = coroutineScope {
             candidates.map { candidate ->
                 async(Dispatchers.IO) {
@@ -577,10 +572,6 @@ class BLZone :
             }.awaitAll()
         }
 
-        /*
-         * Keep every server with at least one validated video.
-         * Faster successful servers are placed first.
-         */
         return resolvedCandidates
             .filter {
                 it.videos.isNotEmpty()
@@ -603,7 +594,6 @@ class BLZone :
         }.getOrDefault(emptyList())
 
         return ResolvedCandidate(
-            serverName = candidate.quality,
             elapsedNanoseconds =
             System.nanoTime() - startedAt,
             videos = resolvedVideos,
@@ -621,10 +611,6 @@ class BLZone :
             return emptyList()
         }
 
-        /*
-         * A server such as P2P may return multiple qualities.
-         * Validate those qualities concurrently as well.
-         */
         return coroutineScope {
             extractedVideos.map { resolved ->
                 async(Dispatchers.IO) {
@@ -642,18 +628,13 @@ class BLZone :
         candidate: Video,
         resolved: Video,
     ): Video? {
-        /*
-         * The result is intentionally removed when videoUrl is empty.
-         * Do not fall back to resolved.url for playback.
-         */
         val directUrl = resolved.videoUrl
             ?.trim()
-            ?.takeIf { it.isNotBlank() }
+            ?.takeIf {
+                it.isNotBlank()
+            }
+            ?.takeIf(::isValidPlayableUrl)
             ?: return null
-
-        if (!isValidPlayableUrl(directUrl)) {
-            return null
-        }
 
         val sourceUrl = resolved.url
             .trim()
@@ -671,6 +652,19 @@ class BLZone :
             subtitleTracks = resolved.subtitleTracks,
             audioTracks = resolved.audioTracks,
         )
+
+        if (
+            candidate.url.contains(
+                "upns.online",
+                ignoreCase = true,
+            ) ||
+            candidate.url.contains(
+                "p2pplay.online",
+                ignoreCase = true,
+            )
+        ) {
+            return finalVideo
+        }
 
         return finalVideo.takeIf {
             isWorkingVideo(it)
@@ -745,7 +739,9 @@ class BLZone :
         url.contains(
             "upns.online",
             ignoreCase = true,
-        ) -> runExtractor {
+        ) -> resolveWithRetry(
+            attempts = 3,
+        ) {
             upnShareExtractor.videosFromUrl(
                 url = url,
                 prefix = "UPnShare",
@@ -755,7 +751,9 @@ class BLZone :
         url.contains(
             "p2pplay.online",
             ignoreCase = true,
-        ) -> runExtractor {
+        ) -> resolveWithRetry(
+            attempts = 3,
+        ) {
             p2pPlayerExtractor.videosFromUrl(
                 url = url,
                 prefix = "P2P",
@@ -770,6 +768,28 @@ class BLZone :
     ): List<Video> = runCatching(block)
         .getOrDefault(emptyList())
 
+    private suspend fun resolveWithRetry(
+        attempts: Int,
+        block: () -> List<Video>,
+    ): List<Video> {
+        repeat(attempts) { index ->
+            val result = runCatching(block)
+                .getOrDefault(emptyList())
+
+            if (result.isNotEmpty()) {
+                return result
+            }
+
+            if (index < attempts - 1) {
+                delay(
+                    (250L * (index + 1)).milliseconds,
+                )
+            }
+        }
+
+        return emptyList()
+    }
+
     // ---- PLAYBACK VALIDATION ----
 
     private suspend fun isWorkingVideo(
@@ -777,7 +797,9 @@ class BLZone :
     ): Boolean {
         val videoUrl = video.videoUrl
             ?.trim()
-            ?.takeIf { it.isNotBlank() }
+            ?.takeIf {
+                it.isNotBlank()
+            }
             ?: return false
 
         return withTimeoutOrNull(8.seconds) {
@@ -835,14 +857,13 @@ class BLZone :
                 return@use false
             }
 
-            val normalizedPlaylist = playlist
-                .trimStart(
-                    '\uFEFF',
-                    ' ',
-                    '\t',
-                    '\r',
-                    '\n',
-                )
+            val normalizedPlaylist = playlist.trimStart(
+                '\uFEFF',
+                ' ',
+                '\t',
+                '\r',
+                '\n',
+            )
 
             normalizedPlaylist.startsWith(
                 "#EXTM3U",
@@ -860,23 +881,16 @@ class BLZone :
 
         val requestBuilder = Request.Builder()
             .url(videoUrl)
-            .header(
-                "Range",
-                "bytes=0-63",
-            )
             .get()
 
         video.headers?.let {
             requestBuilder.headers(it)
-
-            /*
-             * Reapply Range because headers() replaces existing headers.
-             */
-            requestBuilder.header(
-                "Range",
-                "bytes=0-63",
-            )
         }
+
+        requestBuilder.header(
+            "Range",
+            "bytes=0-63",
+        )
 
         val response = runCatching {
             client.newCall(
@@ -947,13 +961,10 @@ class BLZone :
 
     private fun isHlsUrl(
         url: String,
-    ): Boolean {
-        val normalized = url
-            .substringBefore("#")
-            .lowercase()
-
-        return normalized.contains(".m3u8")
-    }
+    ): Boolean = url
+        .substringBefore("#")
+        .lowercase()
+        .contains(".m3u8")
 
     // ---- VIDEO HELPERS ----
 
@@ -1120,10 +1131,6 @@ class BLZone :
             PREF_SERVER_DEFAULT,
         ) ?: PREF_SERVER_DEFAULT
 
-        /*
-         * Results are already ordered by successful extraction and
-         * validation speed.
-         */
         if (preferredServer == FASTEST_SERVER) {
             return this
         }
@@ -1135,10 +1142,6 @@ class BLZone :
             )
         }
 
-        /*
-         * The configured server is unavailable. Preserve the complete
-         * fastest-first result list.
-         */
         if (preferredVideos.isEmpty()) {
             return this
         }
@@ -1150,10 +1153,6 @@ class BLZone :
             )
         }
 
-        /*
-         * Preferred server first, followed by every other validated
-         * server in fastest-first order.
-         */
         return preferredVideos + otherVideos
     }
 

@@ -63,35 +63,17 @@ class UPnShareExtractor(
         val referer = "$baseUrl/"
 
         val requestHeaders = Headers.Builder()
-            .add(
-                "User-Agent",
-                USER_AGENT,
-            )
-            .add(
-                "Referer",
-                referer,
-            )
+            .add("User-Agent", USER_AGENT)
+            .add("Referer", referer)
             .build()
 
         val apiUrl = baseHttpUrl
             .newBuilder()
             .addPathSegments("api/v1/video")
-            .addQueryParameter(
-                "id",
-                token,
-            )
-            .addQueryParameter(
-                "w",
-                "1920",
-            )
-            .addQueryParameter(
-                "h",
-                "1200",
-            )
-            .addQueryParameter(
-                "r",
-                "",
-            )
+            .addQueryParameter("id", token)
+            .addQueryParameter("w", "1920")
+            .addQueryParameter("h", "1200")
+            .addQueryParameter("r", "")
             .build()
 
         val responseText = requestText(
@@ -99,10 +81,10 @@ class UPnShareExtractor(
             headers = requestHeaders,
         ) ?: return emptyList()
 
-        val decodedPayload = decodeResponse(responseText)
+        val decryptedPayload = decodeResponse(responseText)
             ?: return emptyList()
 
-        val streamUrl = extractStreamUrl(decodedPayload)
+        val streamUrl = extractStreamUrl(decryptedPayload)
             ?: return emptyList()
 
         return listOf(
@@ -140,13 +122,15 @@ class UPnShareExtractor(
             client.newCall(request)
                 .execute()
                 .use { response ->
-                    if (!response.isSuccessful) {
-                        return@use null
-                    }
-
-                    response.body
+                    val body = response.body
                         .string()
                         .trim()
+
+                    if (response.isSuccessful) {
+                        body
+                    } else {
+                        null
+                    }
                 }
         }.getOrNull()
     }
@@ -164,7 +148,8 @@ class UPnShareExtractor(
         }
 
         val encryptedHex = when {
-            normalized.isValidHex() -> normalized
+            normalized.isValidHex() ->
+                normalized
 
             else ->
                 HEX_PAYLOAD_REGEX
@@ -239,13 +224,6 @@ class UPnShareExtractor(
 
     private fun String.hexToByteArray(): ByteArray {
         require(length % 2 == 0)
-
-        require(
-            all {
-                it.isDigit() ||
-                    it.lowercaseChar() in 'a'..'f'
-            },
-        )
 
         return ByteArray(length / 2) { index ->
             val start = index * 2
