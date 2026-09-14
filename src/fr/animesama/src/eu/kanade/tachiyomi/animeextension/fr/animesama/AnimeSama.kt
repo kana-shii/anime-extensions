@@ -262,7 +262,12 @@ class AnimeSama :
                     contains(".mp4") -> listOf(Video(playerUrl, "$prefix Direct", playerUrl, headers))
 
                     contains("embed4me") -> try {
-                        embed4MeExtractor.videosFromUrl(playerUrl, prefix)
+                        embed4MeExtractor.videosFromUrl(
+                            url = playerUrl,
+                            prefix = prefix,
+                            referer = "$baseUrl/",
+                            referrer = baseUrl.toHttpUrl().host,
+                        )
                     } catch (_: Exception) {
                         emptyList()
                     }

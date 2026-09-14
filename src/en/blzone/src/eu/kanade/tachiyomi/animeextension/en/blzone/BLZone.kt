@@ -2,10 +2,10 @@ package eu.kanade.tachiyomi.animeextension.en.blzone
 
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.embed4meextractor.Embed4MeExtractor
 import aniyomi.lib.filemoonextractor.FilemoonExtractor
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
-import aniyomi.lib.p2pplayerextractor.P2PPlayerExtractor
 import aniyomi.lib.ruplayextractor.RuplayExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.vidguardextractor.VidGuardExtractor
@@ -204,7 +204,7 @@ class BLZone :
     private val mp4UploadExtractor by lazy { Mp4uploadExtractor(client) }
     private val voeExtractor by lazy { VoeExtractor(client, headers) }
     private val ruplayExtractor by lazy { RuplayExtractor(client) }
-    private val p2pPlayerExtractor by lazy { P2PPlayerExtractor(client) }
+    private val embed4MeExtractor by lazy { Embed4MeExtractor(client, headers) }
 
     // ---- VIDEO LIST PARSE ----
     override fun videoListParse(response: Response): List<Video> {
@@ -247,7 +247,7 @@ class BLZone :
         }
     }
 
-    private fun serverVideoResolver(url: String): List<Video> = when {
+    private suspend fun serverVideoResolver(url: String): List<Video> = when {
         url.contains("filemoon") -> filemoonExtractor.videosFromUrl(url, "FileMoon - ")
         url.contains("byseqekaho") -> filemoonExtractor.videosFromUrl(url, "Byse - ")
         url.contains("streamtape") -> streamtapeExtractor.videosFromUrl(url, "StreamTape")
@@ -256,7 +256,11 @@ class BLZone :
         url.contains("mp4upload") -> mp4UploadExtractor.videosFromUrl(url, headers)
         url.contains("voe") -> voeExtractor.videosFromUrl(url, "Voe")
         url.contains("fsst.online") -> ruplayExtractor.videosFromUrl(url, headers)
-        url.contains("p2pplay.online") -> p2pPlayerExtractor.videosFromUrl(url, headers)
+        url.contains("p2pplay.online") -> embed4MeExtractor.videosFromUrl(
+            url = url,
+            name = "P2P",
+            height = 1200,
+        )
         else -> emptyList()
     }
 
