@@ -107,20 +107,11 @@ class Embed4MeExtractor(
             Log.d(TAG, "Candidate [$index]: $candidate")
         }
 
-        val masterHeaders = headers.newBuilder()
+        val hlsHeaders = headers.newBuilder()
             .set("Accept", "*/*")
             .set("Referer", requestReferer)
             .set("Origin", embedOrigin)
             .build()
-
-        val playbackHeaders = if (apiBaseUrl != null) {
-            headers.newBuilder()
-                .set("Referer", requestReferer)
-                .removeAll("Origin")
-                .build()
-        } else {
-            masterHeaders
-        }
 
         return candidates.parallelCatchingFlatMap { candidateUrl ->
             try {
@@ -139,7 +130,7 @@ class Embed4MeExtractor(
                             candidateUrl,
                             title,
                             candidateUrl,
-                            playbackHeaders,
+                            hlsHeaders,
                         ),
                     )
                 }
@@ -147,8 +138,8 @@ class Embed4MeExtractor(
                 val extractedVideos = playlistUtils.extractFromHls(
                     playlistUrl = candidateUrl,
                     referer = requestReferer,
-                    masterHeaders = masterHeaders,
-                    videoHeaders = playbackHeaders,
+                    masterHeaders = hlsHeaders,
+                    videoHeaders = hlsHeaders,
                     videoNameGen = { quality ->
                         if (quality.equals("Video", ignoreCase = true)) {
                             title
@@ -166,7 +157,7 @@ class Embed4MeExtractor(
                             candidateUrl,
                             title,
                             candidateUrl,
-                            playbackHeaders,
+                            hlsHeaders,
                         ),
                     )
                 } else {
@@ -186,7 +177,7 @@ class Embed4MeExtractor(
                         candidateUrl,
                         title,
                         candidateUrl,
-                        playbackHeaders,
+                        hlsHeaders,
                     ),
                 )
             }
@@ -289,7 +280,7 @@ class Embed4MeExtractor(
             "AES",
         )
 
-        // Standard Embed4Me format: fixed IV.
+        // Standard Embed4Me/P2P format: fixed IV.
         runCatching {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
 
@@ -310,7 +301,7 @@ class Embed4MeExtractor(
                 return it
             }
 
-        // P2P-compatible format: first 16 bytes are the IV.
+        // Fallback for variants where the first 16 bytes contain the IV.
         if (encrypted.size > 16) {
             runCatching {
                 val iv = encrypted.copyOfRange(0, 16)
