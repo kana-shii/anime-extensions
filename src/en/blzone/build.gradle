@@ -1,7 +1,7 @@
 ext {
     extName = 'BLZone'
     extClass = '.BLZone'
-    extVersionCode = 9
+    extVersionCode = 10
     isNsfw = true
 }
 
@@ -14,4 +14,6 @@ dependencies {
     implementation(project(':lib:vidguardextractor'))
     implementation(project(':lib:mp4uploadextractor'))
     implementation(project(':lib:voeextractor'))
+    implementation(project(':lib:ruplayextractor'))
+    implementation(project(':lib:p2pplayerextractor'))
 }

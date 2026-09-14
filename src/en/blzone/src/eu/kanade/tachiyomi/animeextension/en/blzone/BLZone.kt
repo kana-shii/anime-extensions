@@ -5,6 +5,8 @@ import androidx.preference.PreferenceScreen
 import aniyomi.lib.filemoonextractor.FilemoonExtractor
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
+import aniyomi.lib.p2pplayerextractor.P2PPlayerExtractor
+import aniyomi.lib.ruplayextractor.RuplayExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.vidguardextractor.VidGuardExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
@@ -46,7 +48,7 @@ class BLZone :
     companion object {
         private const val PREF_SERVER_KEY = "preferred_server"
         private const val PREF_SERVER_DEFAULT = "Filemoon"
-        private val SERVER_LIST = arrayOf("Filemoon", "StreamTape", "MixDrop", "VidGuard", "MP4", "Voe", "Byse")
+        private val SERVER_LIST = arrayOf("Filemoon", "StreamTape", "MixDrop", "VidGuard", "MP4", "Voe", "Byse", "Ruplay", "P2P")
         private val EPISODE_NUMBER_REGEX = Regex("""Episode (\d+)""", RegexOption.IGNORE_CASE)
     }
 
@@ -201,6 +203,8 @@ class BLZone :
     private val vidGuardExtractor by lazy { VidGuardExtractor(client) }
     private val mp4UploadExtractor by lazy { Mp4uploadExtractor(client) }
     private val voeExtractor by lazy { VoeExtractor(client, headers) }
+    private val ruplayExtractor by lazy { RuplayExtractor(client) }
+    private val p2pPlayerExtractor by lazy { P2PPlayerExtractor(client) }
 
     // ---- VIDEO LIST PARSE ----
     override fun videoListParse(response: Response): List<Video> {
@@ -221,7 +225,7 @@ class BLZone :
             } else {
                 src
             }
-            Video(videoTitle = matchedServerName, videoUrl = videoUrl)
+            Video(videoUrl, matchedServerName, videoUrl)
         }
     }
 
@@ -251,6 +255,8 @@ class BLZone :
         url.contains("vgembed") -> vidGuardExtractor.videosFromUrl(url, "VidGuard")
         url.contains("mp4upload") -> mp4UploadExtractor.videosFromUrl(url, headers)
         url.contains("voe") -> voeExtractor.videosFromUrl(url, "Voe")
+        url.contains("fsst.online") -> ruplayExtractor.videosFromUrl(url, headers)
+        url.contains("p2pplay.online") -> p2pPlayerExtractor.videosFromUrl(url, headers)
         else -> emptyList()
     }
 
