@@ -259,6 +259,7 @@ class BLZone :
         url.contains("p2pplay.online") -> embed4MeExtractor.videosFromUrl(
             url = url,
             name = "P2P",
+            apiBaseUrl = url.substringBefore("#").trimEnd('/'),
             height = 1200,
         )
         else -> emptyList()
