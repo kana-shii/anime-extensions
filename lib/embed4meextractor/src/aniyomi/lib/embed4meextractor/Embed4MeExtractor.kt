@@ -40,111 +40,52 @@ class Embed4MeExtractor(
         prefix: String = "",
         name: String = "Embed4Me",
         referer: String? = null,
-        apiBaseUrl: String? = null,
         height: Int = 1080,
     ): List<Video> {
         val id = extractId(url) ?: return emptyList()
         val embedOrigin = extractOrigin(url) ?: return emptyList()
-        val requestBaseUrl = apiBaseUrl ?: embedOrigin
-        val requestReferer = referer ?: "${requestBaseUrl.trimEnd('/')}/"
+        val requestReferer = referer ?: "$embedOrigin/"
         val referrer = referer?.toHttpUrlOrNull()?.host.orEmpty()
 
-        val apiUrl = buildApiUrl(requestBaseUrl, id, referrer, height)
+        val apiUrl = buildApiUrl(embedOrigin, id, referrer, height)
         val apiHeaders = headers.newBuilder()
-            .set("Accept", "application/json, text/plain, */*")
             .set("Referer", requestReferer)
             .set("Origin", embedOrigin)
+            .set("Accept", "*/*")
             .build()
 
         val raw = try {
-            client.newCall(GET(apiUrl, apiHeaders))
-                .awaitSuccess()
-                .bodyString()
-                .trim()
+            client.newCall(GET(apiUrl, apiHeaders)).awaitSuccess().bodyString().trim()
         } catch (_: Exception) {
             return emptyList()
         }
-
         if (raw.isBlank()) return emptyList()
 
-        val payload = decryptIfNeeded(raw)
-        if (payload.isNullOrBlank()) return emptyList()
+        val jsonStr = decryptIfNeeded(raw) ?: return emptyList()
+        if (jsonStr.isBlank()) return emptyList()
 
-        val candidates = buildCandidates(payload, embedOrigin)
-            ?.takeIf { it.isNotEmpty() }
-            ?: extractStreamUrl(payload)?.let(::listOf)
-            ?: emptyList()
-
+        val candidates = buildCandidates(jsonStr, embedOrigin) ?: return emptyList()
         if (candidates.isEmpty()) return emptyList()
 
         val hlsHeaders = headers.newBuilder()
-            .set("Accept", "*/*")
             .set("Referer", requestReferer)
             .set("Origin", embedOrigin)
             .build()
 
         return candidates.parallelCatchingFlatMap { candidateUrl ->
             try {
-                val title = listOfNotNull(
-                    prefix.trim().takeIf { it.isNotEmpty() },
-                    name,
-                ).joinToString(" ")
-
-                if (
-                    candidateUrl
-                        .substringBefore("?")
-                        .endsWith(".mp4", ignoreCase = true)
-                ) {
-                    return@parallelCatchingFlatMap listOf(
-                        Video(
-                            candidateUrl,
-                            title,
-                            candidateUrl,
-                            hlsHeaders,
-                        ),
-                    )
-                }
-
-                val extractedVideos = playlistUtils.extractFromHls(
-                    playlistUrl = candidateUrl,
-                    referer = requestReferer,
+                playlistUtils.extractFromHls(
+                    candidateUrl,
+                    referer = embedOrigin,
                     masterHeaders = hlsHeaders,
                     videoHeaders = hlsHeaders,
                     videoNameGen = { quality ->
-                        if (quality.equals("Video", ignoreCase = true)) {
-                            title
-                        } else {
-                            "$title - $quality"
-                        }
+                        val trimmed = prefix.trim()
+                        if (trimmed.isNotEmpty()) "$trimmed $name - $quality" else "$name - $quality"
                     },
                 )
-
-                if (extractedVideos.isEmpty()) {
-                    listOf(
-                        Video(
-                            candidateUrl,
-                            title,
-                            candidateUrl,
-                            hlsHeaders,
-                        ),
-                    )
-                } else {
-                    extractedVideos
-                }
             } catch (_: Exception) {
-                val title = listOfNotNull(
-                    prefix.trim().takeIf { it.isNotEmpty() },
-                    name,
-                ).joinToString(" ")
-
-                listOf(
-                    Video(
-                        candidateUrl,
-                        title,
-                        candidateUrl,
-                        hlsHeaders,
-                    ),
-                )
+                emptyList()
             }
         }
     }
@@ -152,7 +93,6 @@ class Embed4MeExtractor(
     private fun extractId(url: String): String? {
         val fragment = url.substringAfter("#", "")
         if (fragment.isBlank()) return null
-
         return fragment.substringBefore("&")
             .substringBefore("?")
             .substringBefore("/")
@@ -162,7 +102,6 @@ class Embed4MeExtractor(
 
     private fun extractOrigin(url: String): String? {
         val withoutFragment = url.substringBefore("#")
-
         return try {
             val httpUrl = withoutFragment.toHttpUrl()
             "${httpUrl.scheme}://${httpUrl.host}"
@@ -183,159 +122,51 @@ class Embed4MeExtractor(
             .addQueryParameter("w", "1920")
             .addQueryParameter("h", height.toString())
             .addQueryParameter("r", referrer)
-            .build()
-            .toString()
+            .build().toString()
     } catch (_: Exception) {
-        "${origin.trimEnd('/')}/api/v1/video?id=$id&w=1920&h=$height&r=$referrer"
+        "$origin/api/v1/video?id=$id&w=1920&h=$height&r=$referrer"
     }
 
     private fun decryptIfNeeded(raw: String): String? {
-        val trimmed = raw
-            .trim()
-            .removeSurrounding("\"")
-            .trim()
-
-        if (extractStreamUrl(trimmed) != null) {
-            return trimmed
-        }
-
-        if (trimmed.startsWith("{")) {
-            val obj = try {
-                json.parseToJsonElement(trimmed) as? JsonObject
-            } catch (_: Exception) {
-                null
-            }
-
-            if (obj != null) {
-                val hexField = obj["data"]?.jsonPrimitive?.contentOrNull
-                    ?: obj["payload"]?.jsonPrimitive?.contentOrNull
-                    ?: obj["result"]?.jsonPrimitive?.contentOrNull
-
-                if (
-                    !hexField.isNullOrBlank() &&
-                    hexField.matches(HEX_REGEX) &&
-                    hexField.length % 2 == 0
-                ) {
-                    return decryptHex(hexField)
+        val trimmed = raw.trim().removeSurrounding("\"")
+        // Already JSON
+        if (trimmed.startsWith("{")) return trimmed
+        // Hex-encoded AES
+        return try {
+            if (trimmed.matches(Regex("^[0-9a-fA-F]+$")) && trimmed.length % 2 == 0) {
+                decryptHex(trimmed)
+            } else {
+                // Try to parse as JSON containing hex field
+                val element = try {
+                    json.parseToJsonElement(trimmed)
+                } catch (_: Exception) {
+                    null
                 }
-
-                return trimmed
-            }
-        }
-
-        val encryptedHex = when {
-            trimmed.matches(HEX_REGEX) && trimmed.length % 2 == 0 -> trimmed
-            else -> HEX_PAYLOAD_REGEX.find(trimmed)?.value
-        } ?: return null
-
-        return decryptHex(encryptedHex)
-    }
-
-    private fun decryptHex(hex: String): String? {
-        val encrypted = runCatching {
-            hex.decodeHex()
-        }.getOrNull() ?: return null
-
-        val key = SecretKeySpec(
-            KEY.toByteArray(Charsets.UTF_8),
-            "AES",
-        )
-
-        runCatching {
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                key,
-                IvParameterSpec(IV.toByteArray(Charsets.UTF_8)),
-            )
-
-            String(
-                cipher.doFinal(encrypted),
-                Charsets.UTF_8,
-            )
-        }.getOrNull()
-            ?.takeIf { it.isValidPayload() }
-            ?.let {
-                return it
-            }
-
-        if (encrypted.size > 16) {
-            runCatching {
-                val iv = encrypted.copyOfRange(0, 16)
-                val cipherText = encrypted.copyOfRange(16, encrypted.size)
-
-                val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-
-                cipher.init(
-                    Cipher.DECRYPT_MODE,
-                    key,
-                    IvParameterSpec(iv),
-                )
-
-                String(
-                    cipher.doFinal(cipherText),
-                    Charsets.UTF_8,
-                )
-            }.getOrNull()
-                ?.takeIf { it.isValidPayload() }
-                ?.let {
-                    return it
+                val obj = element as? JsonObject
+                val hexField = obj?.get("data")?.jsonPrimitive?.contentOrNull
+                    ?: obj?.get("payload")?.jsonPrimitive?.contentOrNull
+                    ?: obj?.get("result")?.jsonPrimitive?.contentOrNull
+                if (!hexField.isNullOrBlank() && hexField.matches(Regex("^[0-9a-fA-F]+$"))) {
+                    decryptHex(hexField)
+                } else {
+                    null
                 }
-        }
-
-        return null
-    }
-
-    private fun String.isValidPayload(): Boolean =
-        extractStreamUrl(this) != null ||
-            trim().startsWith("{")
-
-    private fun extractStreamUrl(payload: String): String? {
-        SOURCE_REGEXES.forEach { regex ->
-            val rawValue = regex
-                .find(payload)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.takeIf { it.isNotBlank() }
-                ?: return@forEach
-
-            val cleaned = unescapeJsonString(rawValue)
-                .replace("&amp;", "&")
-                .trim()
-
-            if (
-                cleaned.startsWith("https://") ||
-                cleaned.startsWith("http://")
-            ) {
-                return cleaned
             }
+        } catch (_: Exception) {
+            null
         }
-
-        val normalized = unescapeJsonString(payload)
-
-        return DIRECT_MEDIA_REGEX
-            .find(normalized)
-            ?.value
-            ?.replace("&amp;", "&")
-            ?.trim()
     }
 
-    private fun unescapeJsonString(value: String): String = value
-        .replace("\\/", "/")
-        .replace("\\u0026", "&", ignoreCase = true)
-        .replace("\\u002F", "/", ignoreCase = true)
-        .replace("\\u003A", ":", ignoreCase = true)
-        .replace("\\u003F", "?", ignoreCase = true)
-        .replace("\\u003D", "=", ignoreCase = true)
-        .replace("\\u0025", "%", ignoreCase = true)
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    private fun decryptHex(hex: String): String {
+        val encrypted = hex.decodeHex()
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        val keySpec = SecretKeySpec(KEY.toByteArray(Charsets.UTF_8), "AES")
+        val ivSpec = IvParameterSpec(IV.toByteArray(Charsets.UTF_8))
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
+        return String(cipher.doFinal(encrypted), Charsets.UTF_8)
+    }
 
-    private fun buildCandidates(
-        jsonStr: String,
-        embedOrigin: String,
-    ): List<String>? {
+    private fun buildCandidates(jsonStr: String, embedOrigin: String): List<String>? {
         val root = try {
             json.parseToJsonElement(jsonStr)
         } catch (_: Exception) {
@@ -343,39 +174,24 @@ class Embed4MeExtractor(
         } as? JsonObject ?: return null
 
         val streamingConfig = root["streamingConfig"].toJsonObject()
-
         val order = (streamingConfig?.get("order") as? JsonArray)
-            ?.mapNotNull {
-                (it as? JsonPrimitive)?.contentOrNull
-            }
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
             ?: emptyList()
 
         val adjustMap = (streamingConfig?.get("adjust") as? JsonObject)
             ?.mapNotNull { entry ->
-                val obj = entry.value as? JsonObject
-                    ?: return@mapNotNull null
-
+                val obj = entry.value as? JsonObject ?: return@mapNotNull null
                 entry.key to Adjust(
-                    disabled = (obj["disabled"] as? JsonPrimitive)
-                        ?.booleanOrNull
-                        ?: false,
-                    domain = (obj["domain"] as? JsonPrimitive)
-                        ?.contentOrNull,
+                    disabled = (obj["disabled"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                    domain = (obj["domain"] as? JsonPrimitive)?.contentOrNull,
                     params = (obj["params"] as? JsonObject)
-                        ?.mapValues { p ->
-                            (p.value as? JsonPrimitive)
-                                ?.contentOrNull
-                                ?: ""
-                        }
+                        ?.mapValues { p -> (p.value as? JsonPrimitive)?.contentOrNull ?: "" }
                         ?.filterValues { it.isNotEmpty() }
                         ?: emptyMap(),
                 )
-            }
-            ?.toMap()
-            ?: emptyMap()
+            }?.toMap() ?: emptyMap()
 
         val pkObj = (root["pk"] ?: root["PK"]).toJsonObject()
-
         val pk = pkObj?.let {
             Pk(
                 k = (it["k"] as? JsonPrimitive)?.contentOrNull,
@@ -383,83 +199,30 @@ class Embed4MeExtractor(
             )
         }
 
-        val sourceKeys = listOf(
-            "cf",
-            "cfNative",
-            "hlsVideoTiktok",
-            "hlsVideoGoogle",
-            "source",
-            "file",
-        )
-
+        // Source fields
+        val sourceKeys = listOf("cf", "cfNative", "hlsVideoTiktok", "hlsVideoGoogle", "source")
         val sourceMap = sourceKeys.mapNotNull { key ->
-            val value = (root[key] as? JsonPrimitive)
-                ?.contentOrNull
-                ?.takeIf { it.isNotBlank() }
-
-            if (value != null) {
-                key to value
-            } else {
-                null
-            }
+            val value = (root[key] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+            if (value != null) key to value else null
         }.toMap()
 
-        val namesInOrder = if (order.isNotEmpty()) {
-            order
-        } else {
-            sourceMap.keys.toList()
-        }
-
+        val namesInOrder = if (order.isNotEmpty()) order else sourceMap.keys.toList()
         if (namesInOrder.isEmpty() && sourceMap.isEmpty()) {
-            val fallback = root.entries.mapNotNull { (key, value) ->
-                val source = (value as? JsonPrimitive)
-                    ?.contentOrNull
-                    ?: return@mapNotNull null
-
-                if (
-                    source.startsWith("http") &&
-                    (
-                        "/hls/" in source ||
-                            ".m3u8" in source ||
-                            ".mp4" in source ||
-                            "/v4/" in source
-                        )
-                ) {
-                    key to source
-                } else {
-                    null
-                }
+            // Fallback: any string value that looks like http
+            val fallback = root.entries.mapNotNull { (k, v) ->
+                val s = (v as? JsonPrimitive)?.contentOrNull ?: return@mapNotNull null
+                if (s.startsWith("http") && ("/hls/" in s || ".m3u8" in s || "/v4/" in s)) k to s else null
             }.toMap()
-
-            if (fallback.isEmpty()) {
-                return emptyList()
-            }
-
-            return buildUrlsFromMap(
-                fallback,
-                adjustMap,
-                pk,
-                embedOrigin,
-                fallback.keys.toList(),
-            )
+            if (fallback.isEmpty()) return emptyList()
+            return buildUrlsFromMap(fallback, adjustMap, pk, embedOrigin, fallback.keys.toList())
         }
 
-        return buildUrlsFromMap(
-            sourceMap,
-            adjustMap,
-            pk,
-            embedOrigin,
-            namesInOrder,
-        )
+        return buildUrlsFromMap(sourceMap, adjustMap, pk, embedOrigin, namesInOrder)
     }
 
     private fun JsonElement?.toJsonObject(): JsonObject? = when (this) {
         is JsonObject -> this
-
-        is JsonPrimitive -> if (
-            isString &&
-            content.startsWith("{")
-        ) {
+        is JsonPrimitive -> if (isString && content.startsWith("{")) {
             try {
                 json.parseToJsonElement(content) as? JsonObject
             } catch (_: Exception) {
@@ -468,7 +231,6 @@ class Embed4MeExtractor(
         } else {
             null
         }
-
         else -> null
     }
 
@@ -480,107 +242,56 @@ class Embed4MeExtractor(
         order: List<String>,
     ): List<String> {
         val result = mutableListOf<String>()
-
         for (name in order) {
             val rawUrl = sourceMap[name] ?: continue
             if (rawUrl.isBlank()) continue
-
-            val adjust = adjustMap[name]
-
-            if (adjust?.disabled == true) {
-                continue
-            }
+            val adj = adjustMap[name]
+            if (adj?.disabled == true) continue
 
             var url = rawUrl
 
-            if (
-                adjust != null &&
-                adjust.params.isNotEmpty()
-            ) {
-                url = appendParams(
-                    url,
-                    adjust.params,
-                )
+            // Apply params
+            if (adj != null && adj.params.isNotEmpty()) {
+                url = appendParams(url, adj.params)
             }
 
-            if (
-                adjust?.domain != null &&
-                "/hls/" in url
-            ) {
-                url = url.replace(
-                    "/hls/",
-                    "/hlsmod/${adjust.domain}/",
-                )
+            // Rewrite /hls/ -> /hlsmod/<domain>/
+            if (adj?.domain != null && "/hls/" in url) {
+                url = url.replace("/hls/", "/hlsmod/${adj.domain}/")
             }
 
+            // Resolve against embed origin if relative
             if (!url.startsWith("http")) {
-                val base = embedOrigin.toHttpUrlOrNull()
-                    ?: continue
-
-                url = base.resolve(url)
-                    ?.toString()
-                    ?: continue
+                val base = embedOrigin.toHttpUrlOrNull() ?: continue
+                url = base.resolve(url)?.toString() ?: continue
             }
 
-            if (
-                "/v4/" in url &&
-                pk != null &&
-                !pk.k.isNullOrBlank() &&
-                !pk.kx.isNullOrBlank()
-            ) {
-                url = appendParams(
-                    url,
-                    mapOf(
-                        "k" to pk.k!!,
-                        "kx" to pk.kx!!,
-                    ),
-                )
+            // Append pk token for /v4/
+            if ("/v4/" in url && pk != null && !pk.k.isNullOrBlank() && !pk.kx.isNullOrBlank()) {
+                url = appendParams(url, mapOf("k" to pk.k!!, "kx" to pk.kx!!))
             }
 
-            val fixed = url.toHttpUrlOrNull()
-                ?: continue
-
+            val fixed = url.toHttpUrlOrNull() ?: continue
             result.add(fixed.toString())
         }
-
         return result.distinct()
     }
 
-    private fun appendParams(
-        url: String,
-        params: Map<String, String>,
-    ): String {
-        if (params.isEmpty()) {
-            return url
-        }
-
+    private fun appendParams(url: String, params: Map<String, String>): String {
+        if (params.isEmpty()) return url
         return try {
             val httpUrl = url.toHttpUrlOrNull()
-
             if (httpUrl != null) {
                 val builder = httpUrl.newBuilder()
-
-                params.forEach { (key, value) ->
-                    builder.addQueryParameter(
-                        key,
-                        value,
-                    )
-                }
-
+                params.forEach { (k, v) -> builder.addQueryParameter(k, v) }
                 builder.build().toString()
             } else {
-                val separator = if ("?" in url) "&" else "?"
-
-                url + separator + params.entries.joinToString("&") {
-                    "${it.key}=${it.value}"
-                }
+                val sep = if ("?" in url) "&" else "?"
+                url + sep + params.entries.joinToString("&") { "${it.key}=${it.value}" }
             }
         } catch (_: Exception) {
-            val separator = if ("?" in url) "&" else "?"
-
-            url + separator + params.entries.joinToString("&") {
-                "${it.key}=${it.value}"
-            }
+            val sep = if ("?" in url) "&" else "?"
+            url + sep + params.entries.joinToString("&") { "${it.key}=${it.value}" }
         }
     }
 
@@ -598,27 +309,5 @@ class Embed4MeExtractor(
     companion object {
         private const val KEY = "kiemtienmua911ca"
         private const val IV = "1234567890oiuytr"
-
-        private val HEX_REGEX =
-            Regex("^[0-9a-fA-F]+$")
-
-        private val HEX_PAYLOAD_REGEX =
-            Regex("[0-9a-fA-F]{64,}")
-
-        private val SOURCE_REGEXES = listOf(
-            Regex(
-                """["']source["']\s*:\s*["']((?:\\.|[^"'\\])*)["']""",
-                RegexOption.IGNORE_CASE,
-            ),
-            Regex(
-                """["']file["']\s*:\s*["']((?:\\.|[^"'\\])*)["']""",
-                RegexOption.IGNORE_CASE,
-            ),
-        )
-
-        private val DIRECT_MEDIA_REGEX = Regex(
-            """https?://[^\s"']+?\.(?:m3u8|mp4)(?:\?[^\s"']*)?""",
-            RegexOption.IGNORE_CASE,
-        )
     }
 }
