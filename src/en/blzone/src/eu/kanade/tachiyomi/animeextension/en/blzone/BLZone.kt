@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.animeextension.en.blzone
 
-import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.embed4meextractor.Embed4MeExtractor
@@ -47,8 +46,6 @@ class BLZone :
     private val preferences by getPreferencesLazy()
 
     companion object {
-        private const val TAG = "BLZone"
-
         private const val PREF_SERVER_KEY = "preferred_server"
         private const val PREF_SERVER_DEFAULT = "Filemoon"
         private val SERVER_LIST = arrayOf("Filemoon", "StreamTape", "MixDrop", "VidGuard", "MP4", "Voe", "Byse", "Ruplay", "P2P")
@@ -233,33 +230,14 @@ class BLZone :
         val serverNames = document.select("#playeroptionsul li span.title").map { it.text() }
         val serverBoxes = document.select(".dooplay_player .source-box").drop(1)
 
-        Log.d(TAG, "Server names: $serverNames")
-        Log.d(TAG, "Server boxes: ${serverBoxes.size}")
-
         return serverBoxes.mapIndexedNotNull { index, box ->
-            val serverName = serverNames.getOrNull(index)
-
-            if (serverName == null) {
-                Log.d(TAG, "No server name for source-box index $index")
-                return@mapIndexedNotNull null
-            }
-
-            val matchedServerName = SERVER_LIST.firstOrNull {
-                serverName.contains(it, ignoreCase = true)
-            }
-
-            if (matchedServerName == null) {
-                Log.d(TAG, "Unknown server: $serverName")
-                return@mapIndexedNotNull null
-            }
+            val matchedServerName = serverNames.getOrNull(index)?.let { serverName ->
+                SERVER_LIST.firstOrNull { serverName.contains(it, ignoreCase = true) }
+            } ?: return@mapIndexedNotNull null
 
             val iframe = box.selectFirst("iframe.metaframe")
             val src = iframe?.attr("src")?.trim().orEmpty()
-
-            if (src.isBlank()) {
-                Log.d(TAG, "Empty iframe src for $serverName")
-                return@mapIndexedNotNull null
-            }
+            if (src.isBlank()) return@mapIndexedNotNull null
 
             val videoUrl = if (src.contains("/diclaimer/?url=")) {
                 URLDecoder.decode(
@@ -268,15 +246,6 @@ class BLZone :
                 )
             } else {
                 src
-            }
-
-            Log.d(
-                TAG,
-                "Server: $serverName | Matched: $matchedServerName | URL: $videoUrl",
-            )
-
-            if (matchedServerName.equals("P2P", ignoreCase = true)) {
-                Log.d(TAG, "P2P iframe URL: $videoUrl")
             }
 
             Video(videoUrl, matchedServerName, videoUrl)
@@ -288,26 +257,12 @@ class BLZone :
         val response = client.newCall(GET(baseUrl + episode.url)).await()
         val videos = videoListParse(response)
 
-        Log.d(TAG, "Parsed ${videos.size} server URLs")
-
         return coroutineScope {
             videos.map { video ->
                 async(Dispatchers.IO) {
                     try {
-                        val result = serverVideoResolver(video.videoUrl)
-
-                        Log.d(
-                            TAG,
-                            "Resolver returned ${result.size} video(s) for ${video.videoTitle}",
-                        )
-
-                        result
-                    } catch (e: Exception) {
-                        Log.e(
-                            TAG,
-                            "Resolver failed for ${video.videoTitle}: ${video.videoUrl}",
-                            e,
-                        )
+                        serverVideoResolver(video.videoUrl)
+                    } catch (_: Exception) {
                         emptyList()
                     }
                 }
@@ -332,52 +287,14 @@ class BLZone :
 
         url.contains("fsst.online") -> ruplayExtractor.videosFromUrl(url, headers)
 
-        url.contains("p2pplay.online") -> {
-            val apiBaseUrl = url.substringBefore("#").trimEnd('/')
+        url.contains("p2pplay.online") -> embed4MeExtractor.videosFromUrl(
+            url = url,
+            name = "P2P",
+            apiBaseUrl = url.substringBefore("#").trimEnd('/'),
+            height = 1200,
+        )
 
-            Log.d(TAG, "P2P resolver URL: $url")
-            Log.d(TAG, "P2P API base URL: $apiBaseUrl")
-            Log.d(TAG, "P2P fragment: ${url.substringAfter("#", "<none>")}")
-
-            try {
-                val result = embed4MeExtractor.videosFromUrl(
-                    url = url,
-                    name = "P2P",
-                    apiBaseUrl = apiBaseUrl,
-                    height = 1200,
-                )
-
-                Log.d(TAG, "P2P extractor returned ${result.size} video(s)")
-
-                result.forEachIndexed { index, video ->
-                    Log.d(
-                        TAG,
-                        "P2P result [$index]: ${video.videoTitle} | ${video.videoUrl}",
-                    )
-                }
-
-                if (result.isEmpty()) {
-                    Log.w(
-                        TAG,
-                        "P2P extractor returned no videos for URL: $url",
-                    )
-                }
-
-                result
-            } catch (e: Exception) {
-                Log.e(
-                    TAG,
-                    "P2P extraction failed for URL: $url",
-                    e,
-                )
-                emptyList()
-            }
-        }
-
-        else -> {
-            Log.d(TAG, "No extractor matched URL: $url")
-            emptyList()
-        }
+        else -> emptyList()
     }
 
     override fun List<Video>.sortVideos(): List<Video> {

@@ -1,6 +1,5 @@
 package aniyomi.lib.embed4meextractor
 
-import android.util.Log
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
@@ -57,55 +56,26 @@ class Embed4MeExtractor(
             .set("Origin", embedOrigin)
             .build()
 
-        Log.d(TAG, "URL: $url")
-        Log.d(TAG, "ID: $id")
-        Log.d(TAG, "Origin: $embedOrigin")
-        Log.d(TAG, "API base: $requestBaseUrl")
-        Log.d(TAG, "API URL: $apiUrl")
-        Log.d(TAG, "Referer: $requestReferer")
-
         val raw = try {
             client.newCall(GET(apiUrl, apiHeaders))
                 .awaitSuccess()
                 .bodyString()
                 .trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "API request failed: $apiUrl", e)
+        } catch (_: Exception) {
             return emptyList()
         }
 
-        if (raw.isBlank()) {
-            Log.w(TAG, "API returned an empty response")
-            return emptyList()
-        }
-
-        Log.d(TAG, "API response length: ${raw.length}")
-        Log.d(TAG, "API response start: ${raw.take(150)}")
+        if (raw.isBlank()) return emptyList()
 
         val payload = decryptIfNeeded(raw)
-        if (payload.isNullOrBlank()) {
-            Log.w(TAG, "Could not decode/decrypt API response")
-            return emptyList()
-        }
-
-        Log.d(TAG, "Decoded payload length: ${payload.length}")
-        Log.d(TAG, "Decoded payload start: ${payload.take(200)}")
+        if (payload.isNullOrBlank()) return emptyList()
 
         val candidates = buildCandidates(payload, embedOrigin)
             ?.takeIf { it.isNotEmpty() }
             ?: extractStreamUrl(payload)?.let(::listOf)
             ?: emptyList()
 
-        if (candidates.isEmpty()) {
-            Log.w(TAG, "No stream candidates found in decoded payload")
-            return emptyList()
-        }
-
-        Log.d(TAG, "Found ${candidates.size} candidate(s)")
-
-        candidates.forEachIndexed { index, candidate ->
-            Log.d(TAG, "Candidate [$index]: $candidate")
-        }
+        if (candidates.isEmpty()) return emptyList()
 
         val hlsHeaders = headers.newBuilder()
             .set("Accept", "*/*")
@@ -150,8 +120,6 @@ class Embed4MeExtractor(
                 )
 
                 if (extractedVideos.isEmpty()) {
-                    Log.w(TAG, "HLS parsing returned no videos, using direct stream")
-
                     listOf(
                         Video(
                             candidateUrl,
@@ -161,12 +129,9 @@ class Embed4MeExtractor(
                         ),
                     )
                 } else {
-                    Log.d(TAG, "HLS returned ${extractedVideos.size} video(s)")
                     extractedVideos
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to process candidate: $candidateUrl", e)
-
+            } catch (_: Exception) {
                 val title = listOfNotNull(
                     prefix.trim().takeIf { it.isNotEmpty() },
                     name,
@@ -231,7 +196,6 @@ class Embed4MeExtractor(
             .trim()
 
         if (extractStreamUrl(trimmed) != null) {
-            Log.d(TAG, "Response already contains a stream URL")
             return trimmed
         }
 
@@ -252,7 +216,6 @@ class Embed4MeExtractor(
                     hexField.matches(HEX_REGEX) &&
                     hexField.length % 2 == 0
                 ) {
-                    Log.d(TAG, "Found encrypted hex inside JSON response")
                     return decryptHex(hexField)
                 }
 
@@ -264,8 +227,6 @@ class Embed4MeExtractor(
             trimmed.matches(HEX_REGEX) && trimmed.length % 2 == 0 -> trimmed
             else -> HEX_PAYLOAD_REGEX.find(trimmed)?.value
         } ?: return null
-
-        Log.d(TAG, "Found encrypted hex payload: ${encryptedHex.length} chars")
 
         return decryptHex(encryptedHex)
     }
@@ -280,7 +241,6 @@ class Embed4MeExtractor(
             "AES",
         )
 
-        // Standard Embed4Me/P2P format: fixed IV.
         runCatching {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
 
@@ -297,11 +257,9 @@ class Embed4MeExtractor(
         }.getOrNull()
             ?.takeIf { it.isValidPayload() }
             ?.let {
-                Log.d(TAG, "Decrypted using fixed IV")
                 return it
             }
 
-        // Fallback for variants where the first 16 bytes contain the IV.
         if (encrypted.size > 16) {
             runCatching {
                 val iv = encrypted.copyOfRange(0, 16)
@@ -322,18 +280,16 @@ class Embed4MeExtractor(
             }.getOrNull()
                 ?.takeIf { it.isValidPayload() }
                 ?.let {
-                    Log.d(TAG, "Decrypted using payload IV")
                     return it
                 }
         }
 
-        Log.w(TAG, "AES decryption failed")
-
         return null
     }
 
-    private fun String.isValidPayload(): Boolean = extractStreamUrl(this) != null ||
-        trim().startsWith("{")
+    private fun String.isValidPayload(): Boolean =
+        extractStreamUrl(this) != null ||
+            trim().startsWith("{")
 
     private fun extractStreamUrl(payload: String): String? {
         SOURCE_REGEXES.forEach { regex ->
@@ -640,8 +596,6 @@ class Embed4MeExtractor(
     )
 
     companion object {
-        private const val TAG = "Embed4MeExtractor"
-
         private const val KEY = "kiemtienmua911ca"
         private const val IV = "1234567890oiuytr"
 
